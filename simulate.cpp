@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <cstdio>
+// #include "gpu_loader.cpp"
 //in_simulate_imports:
 // #include <SFML/Graphics.hpp>
 // #include <vector>
@@ -133,20 +134,23 @@ public:
         this->sy = sy;
         this->en = en;
     }
-    void attract(double other_x, double other_y, double other_mass) {
-        double dx = other_x - x;
-        double dy = other_y - y;
-        double dist_sq = dx * dx + dy * dy;
-        double dist = std::sqrt(dist_sq);
+    // void attract(double other_x, double other_y, double other_mass) {
+    //     double dx = other_x - x;
+    //     double dy = other_y - y;
+    //     double dist_sq = dx * dx + dy * dy;
+    //     double dist = std::sqrt(dist_sq);
         
-        // Закон всемирного тяготения (G = 1 для простоты)
-        double force = (other_mass*strength/1e9) / dist_sq; 
+    //     // Закон всемирного тяготения (G = 1 для простоты)
+    //     double force = (other_mass*strength/1e9) / dist_sq; 
         
-        acc_x += force * (dx / dist);
-        acc_y += force * (dy / dist);
-    }
+    //     acc_x += force * (dx / dist);
+    //     acc_y += force * (dy / dist);
+    // }
     bool attract(const Molecule& other) {
-        double distance = magnitude(this->x-other.x, this->y-other.y);
+        const double dx = other.x-this->x;
+        const double dy = other.y-this->y;
+        double distanceSq = dx*dx+dy*dy;
+        double distance = sqrt(distanceSq);
         if (planets_mode && distance<=get_r()+other.get_r()) {
             return true;
         }
@@ -171,9 +175,10 @@ public:
 
         // this->acc_x += force * dx/distance;
         // this->acc_y += force * dy/distance;
-        const double directionx = (other.x-this->x)/distance;
-        const double directiony = (other.y-this->y)/distance;
-        const double ratio_mass = (other.size*strength/1e9)/distance/distance;
+        double inv = 1.0/distance;
+        const double directionx = (other.x-this->x)*inv;
+        const double directiony = (other.y-this->y)*inv;
+        const double ratio_mass = (other.size*strength/1e9)*inv*inv;
         //std::scoped_lock lock(m);
         this->acc_x += directionx*ratio_mass;
         // this->sx += sin(direction)*strength*ratio_mass*dt*speed/distance;
@@ -243,7 +248,27 @@ public:
         }
         r.draw(circle);
     }
-    inline double get_r() const {
+    // inline bool is_in_cache_r() const {
+    //     if (molecs.empty()) return false;
+        
+    //     // Приводим всё к единому типу const Molecule*
+    //     const Molecule* start = (const Molecule*)molecs.data(); 
+    //     const Molecule* end   = start + molecs.size(); // Указывает на "за край" вектора
+    //     const Molecule* curr  = this;
+
+    //     return (curr >= start && curr < end);
+    // }
+    inline bool is_in_cache_r() const;
+
+    // inline double get_r() const {
+    //     if (is_in_cache_r()) {
+    //         return r_cache[this - (const Molecule*)molecs.data()];
+    //     } else {
+    //         return get_r();
+    //     }
+    // }
+    inline double get_r() const;
+    inline double get_r_real() const {
         if (!planets_mode) {
             return this->size;
         }
@@ -269,7 +294,7 @@ public:
 
         // Формула: r = куб_корень(3m / 4πρ)
         double volume = this->size / rho;
-        double radius = std::pow((3.0 * volume) / (4.0 * M_PI), 1.0 / 3.0);
+        double radius = std::cbrt((3.0 * volume) / (4.0 * M_PI));
 
         return radius/1000.0;
     }
@@ -302,6 +327,25 @@ public:
         return f_prilive-f_grav;
     }
 };
+std::vector<Molecule> molecs;
+std::vector<double> r_cache;
+inline bool Molecule::is_in_cache_r() const {
+    if (molecs.empty()) return false;
+    
+    // Приводим всё к единому типу const Molecule*
+    const Molecule* start = (const Molecule*)molecs.data(); 
+    const Molecule* end   = start + molecs.size(); // Указывает на "за край" вектора
+    const Molecule* curr  = this;
+
+    return (curr >= start && curr < end);
+}
+inline double Molecule::get_r() const {
+    if (is_in_cache_r()) {
+        return r_cache[this - (const Molecule*)molecs.data()];
+    } else {
+        return get_r_real();
+    }
+}
 int random_int(int min_val, int max_val) {
     std::random_device rd;
     std::uniform_int_distribution<int> dist(min_val, max_val);
@@ -862,7 +906,6 @@ void printStats(const std::vector<Molecule>& molecs) {
 }
 int main() {
     defaultFont.loadFromFile("C:/Windows/Fonts/arial.ttf");
-    std::vector<Molecule> molecs;
     molecs.resize(100);
     for (int i = 0; i!=100; i++) {
         molecs[i] = random_molec;
@@ -1087,7 +1130,7 @@ int main() {
                                 std::cout << "load: " << size << " objects" << std::endl;
 
                             } else {
-                                std::cerr << "I do`t open file!" << std::endl;
+                                std::cerr << "I doт`t open file!" << std::endl;
                             }
                         }
                     }
@@ -1169,6 +1212,11 @@ int main() {
         // dt = 1.0/cfps;
         window.setTitle("Simulate (SFML) (FPS="+std::to_string(static_cast<int>(1/dt))+", Speed="+ format_sspeed(speed)+", chaos="+ format_dist(chaos)+", width="+ format_dist(width/scale) +" km)");
         if (!stop_simulate) {
+            r_cache.resize(molecs.size());
+            #pragma omp parallel for num_threads(4) schedule(static)
+            for (int i = 0; i!=molecs.size(); i++) {
+                r_cache[i] = molecs[i].get_r_real();
+            }
             #pragma omp parallel for num_threads(4) schedule(static)
             for (auto& molec: molecs) {
                 molec.forward();
@@ -1254,13 +1302,18 @@ int main() {
                 for (auto& molec: need_create) {
                     molecs.push_back(molec);
                 }
+                int past_size = r_cache.size();
+                r_cache.resize(molecs.size());
+                for (int i = past_size; i!=r_cache.size(); i++) {
+                    r_cache[i] = molecs[i].get_r_real();
+                }
             }
             std::vector<std::pair<Molecule*, Molecule*>> is_collizes;
             #pragma omp parallel for num_threads(4) schedule(static)
             for (auto& molec: molecs) {
                 auto info = molec.gravity_start();
                 for (auto& molec2: molecs) {
-                    if (&molec != &molec2 && molec2.size>1e20) {
+                    if (&molec != &molec2) {
                         bool is_collize = molec.attract(molec2);
                         if (is_collize) {
                             m.lock();
@@ -1304,7 +1357,17 @@ int main() {
                         info_mode = false;
                     }
                     molecs.erase(molecs.begin() + i);
+                    r_cache.erase(r_cache.begin() + i);
                 }
+            }
+        } else if (r_cache.size()!=molecs.size()) {
+            if (r_cache.size()<molecs.size()) {
+                std::cerr << "error recreate r_cache\n";
+            }
+            int past_size = r_cache.size();
+            r_cache.resize(molecs.size());
+            for (int i = past_size; i!=r_cache.size(); i++) {
+                r_cache[i] = molecs[i].get_r_real();
             }
         }
         window.clear(sf::Color::White);
@@ -1518,6 +1581,7 @@ int main() {
                 for (int i = 0; i!=molecs.size(); i++) {
                     if (destroys[i]) {
                         molecs.erase(molecs.begin()+i-bias_i);
+                        r_cache.erase(r_cache.begin()+i-bias_i);
                         bias_i += 1;
                     }
                 }
@@ -1529,40 +1593,40 @@ int main() {
             double temperature = 0;
             sf::RectangleShape rect(sf::Vector2f(chunk, chunk));
             //#pragma omp parallel for num_threads(4) schedule(static)
-            for (int x = 0; x<800; x+=chunk) {
-                for (int y = 0; y<600; y+=chunk) {
-                    double centryx = (x+chunk/2)/scale;
-                    double centryy = (y+chunk/2)/scale;
+            for (int x = 0; x<width; x+=chunk) {
+                for (int y = 0; y<height; y+=chunk) {
+                    Vector2d vec = from_coords(sf::Vector2f(x+chunk/2, y+chunk/2), 0);
+                    const double centryx = vec.x;
+                    const double centryy = vec.y;
+                    // double centryy = (y+chunk/2)/scale;
                     std::vector<Molecule> finds;
                     if (temperature_snow) {
-                        double avg_sx = 0;
-                        double avg_sy = 0;
+                        // double avg_sx = 0;
+                        // double avg_sy = 0;
+                        double ek = 0;
                         // #pragma omp parallel for num_threads(4) schedule(static)
                         for (const auto& molec: molecs) {
-                            if (molec.x-centryx>distance_find || molec.y-centryy>distance_find) {
+                            if (molec.x-centryx>distance_find/scale || molec.y-centryy>distance_find/scale) {
                                 continue;
                             }
                             double distance = magnitude(molec.x-centryx, molec.y-centryy);
-                            if (distance<distance_find) {
+                            if (distance<distance_find/scale) {
                                 // m.lock();
-                                avg_sx += molec.sx;
-                                avg_sy += molec.sx;
+                                ek += (molec.sx*molec.sx+molec.sy*molec.sy)*molec.size;
                                 finds.push_back(molec);
                                 // m.unlock();
                             }
                         }
                         if (!finds.empty()) {
-                            avg_sx /= finds.size();
-                            avg_sy /= finds.size();
-                            double max_change = 0;
-                            for (const auto& molec: molecs) {
-                                double change = (abs(molec.sx-avg_sx)+abs(molec.sy-avg_sy))/(magnitude(molec.x-centryx, molec.y-centryy)+2);
-                                if (change>max_change) {
-                                    max_change = change;
-                                }
-                            }
+                            double max_change = ek/distance_find/scale;
+                            // for (const auto& molec: molecs) {
+                            //     double change = (abs(molec.sx-avg_sx)+abs(molec.sy-avg_sy))/(magnitude(molec.x-centryx, molec.y-centryy)+2);
+                            //     if (change>max_change) {
+                            //         max_change = change;
+                            //     }
+                            // }
 
-                            temperature = max_change*20;
+                            temperature = max_change/1e32;
                             sf::Color col(0,0,0, 128);
                             if (temperature>40) {
                                 if (temperature<255) {
@@ -1590,11 +1654,11 @@ int main() {
                     if (density_snow) {
                         density = 0;
                         for (const auto& molec: molecs) {
-                            if (molec.x-centryx>distance_find || molec.y-centryy>distance_find) {
+                            if (molec.x-centryx>distance_find/scale || molec.y-centryy>distance_find/scale) {
                                 continue;
                             }
                             double distance = magnitude(molec.x-centryx, molec.y-centryy);
-                            if (distance<distance_find) {
+                            if (distance<distance_find/scale) {
                                 density += 1/distance;
                             }
                         }
