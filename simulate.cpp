@@ -904,6 +904,45 @@ void printStats(const std::vector<Molecule>& molecs) {
     printf("Debris:  %d (%.2f%%)\n", dust,    pct(dust));
     printf("---------------------\n");
 }
+sf::ConvexShape createRoundedRect(float width, float height, float radius) {
+    sf::ConvexShape shape;
+    unsigned int quality = 10; // Сколько точек на угол
+    shape.setPointCount(quality * 4);
+
+    for (int i = 0; i < 4; i++) {
+        float centerX = (i == 0 || i == 3) ? radius : width - radius;
+        float centerY = (i == 0 || i == 1) ? radius : height - radius;
+        for (int j = 0; j < quality; j++) {
+            float angle = (i + (float)j / (quality - 1)) * 3.14159f / 2.0f + 3.14159f;
+            shape.setPoint(i * quality + j, sf::Vector2f(centerX + radius * cos(angle), centerY + radius * sin(angle)));
+        }
+    }
+    return shape;
+}
+sf::Text createTextForButton(std::string str, sf::Vector2f pos, float width, float height, float radius) {
+    width -= radius;
+    width -= radius;
+    height -= radius;
+    height -= radius;
+    int size_char = width/str.length()*1.5;
+    if (size_char>height) {
+        size_char = height;
+    }
+    sf::Text text;
+    text.setFont(defaultFont);
+    text.setCharacterSize(size_char);
+    text.setString(str);
+    text.setPosition(pos.x+radius+(width-size_char/1.5*str.length())*0.5, pos.y+radius+(height-size_char)*0.5);
+    return text;
+}
+bool is_click_button(sf::Vector2f pos, sf::Vector2f size, sf::Vector2f click) {
+    return pos.x<=click.x && click.x<=pos.x+size.x && pos.y<=click.y && click.y<=pos.y+size.y;
+}
+const float padd_buttons_info = 5.0f;
+const float round_buttons = 5.0f;
+// buttons
+const float button_view_width = 80;
+const float button_view_height = 30;
 int main() {
     defaultFont.loadFromFile("C:/Windows/Fonts/arial.ttf");
     molecs.resize(100);
@@ -925,6 +964,7 @@ int main() {
     double distance_metr = 0;
 
     bool info_mode = false;
+    bool view_mode = false;
     int info_planet_index = 0;
 
     bool remove_mode = false;
@@ -941,6 +981,7 @@ int main() {
         std::cout << ":( что-то пошло не так с GPU" << std::endl;
         return -1;
     }
+    sf::Vector2i lastMousePos;
     while (window.isOpen()) {
         sf::Event event;
         while (window.pollEvent(event)) {
@@ -953,8 +994,50 @@ int main() {
                 window.setView(sf::View(visibleArea));
                 renderTexture.create(width, height);
                 clock.restart();
+            } else if (event.type == sf::Event::MouseButtonPressed && !remove_mode) {
+                const sf::Vector2f mouse_posp = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                const Molecule& molec = molecs[info_planet_index];
+
+                float screen_radius = std::max(molec.get_r() * scale, 2.0);
+                // screen_radius += 2;
+
+                sf::Vector2f screen_pos = to_coords(Vector2d(molec.x, molec.y), 0);
+
+                sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
+                if (info_mode && is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_posp)) {
+                    view_mode = !view_mode;
+                } else {
+                    info_mode = true;
+                    Vector2d mouse_pos = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
+                    bool find = false;
+                    double min_dist = HUGE_VAL;
+                    for (int i = 0; i!=molecs.size(); i++) {
+                        double dist = magnitude(mouse_pos.x-molecs[i].x, mouse_pos.y-molecs[i].y);
+                        if (dist<=1.5*std::max(molecs[i].get_r()*scale, 2.0)/scale && min_dist>dist) {
+                            info_planet_index = i;
+                            min_dist = dist;
+                            find = true;
+                        }
+                    }
+                    if (!find) {
+                        info_mode = false;
+                        view_mode = false;
+                    }
+                }
+            } else if (event.type == sf::Event::MouseMoved && !remove_mode) {
+                if (sf::Mouse::isButtonPressed(sf::Mouse::Left)) {
+                    Vector2d past_pos = from_coords(sf::Vector2f(lastMousePos), 0);
+                    Vector2d new_pos = from_coords(sf::Vector2f(event.mouseMove.x, event.mouseMove.y), 0);
+                    Vector2d diff = new_pos-past_pos;
+                    camx -= diff.x;
+                    camy -= diff.y;
+                }
+                lastMousePos = sf::Vector2i(event.mouseMove.x, event.mouseMove.y);
             } else if (event.type == sf::Event::MouseWheelScrolled) {
-                if (event.mouseWheelScroll.wheel == sf::Mouse::VerticalWheel && planets_mode) {
+                bool isControl = sf::Keyboard::isKeyPressed(sf::Keyboard::LControl) || sf::Keyboard::isKeyPressed(sf::Keyboard::RControl);
+                const float sensor = 20;
+                sf::Vector2f moved(0, 0);
+                if ((isControl || abs(event.mouseWheelScroll.delta)==abs(round(event.mouseWheelScroll.delta))) && event.mouseWheelScroll.wheel == sf::Mouse::VerticalWheel && planets_mode) {
                     sf::Vector2f beforeCoord = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
                     Vector2d start_pos = from_coords(beforeCoord, 0);
@@ -967,6 +1050,17 @@ int main() {
                     Vector2d move = start_pos-end_pos;
                     camx += move.x;
                     camy += move.y;
+                } else if (!isControl && event.mouseWheelScroll.wheel == sf::Mouse::VerticalWheel) {
+                    moved.y += event.mouseWheelScroll.delta*sensor;
+                }  else if (!isControl && event.mouseWheelScroll.wheel == sf::Mouse::HorizontalWheel) {
+                    moved.x += event.mouseWheelScroll.delta*sensor;
+                }
+                if (!(moved.x==0 && moved.y==0)) {
+                    Vector2d past_pos = from_coords(sf::Vector2f(0, 0), 0);
+                    Vector2d new_pos = from_coords(moved, 0);
+                    Vector2d diff = new_pos-past_pos;
+                    camx -= diff.x;
+                    camy -= diff.y;
                 }
             } else if (event.type == sf::Event::KeyPressed) {
                 if (event.key.code == sf::Keyboard::E) {
@@ -1064,6 +1158,7 @@ int main() {
                     metr_mode = false;
                     distance_metr = 0;
                     remove_mode = false;
+                    view_mode = false;
                 } else if (event.key.code == sf::Keyboard::Escape) {
                     stop_simulate = !stop_simulate;
                 } else if (event.key.code == sf::Keyboard::M) {
@@ -1185,7 +1280,7 @@ int main() {
                             double min_dist = HUGE_VAL;
                             for (int i = 0; i!=molecs.size(); i++) {
                                 double dist = magnitude(mouse_pos.x-molecs[i].x, mouse_pos.y-molecs[i].y);
-                                if (dist<=4*molecs[i].get_r() && min_dist>dist) {
+                                if (dist<=4*std::max(molecs[i].get_r()*scale, 2.0)/scale && min_dist>dist) {
                                     info_planet_index = i;
                                     min_dist = dist;
                                     find = true;
@@ -1193,6 +1288,7 @@ int main() {
                             }
                             if (!find) {
                                 info_mode = false;
+                                view_mode = false;
                             }
                         }
                     }
@@ -1219,7 +1315,14 @@ int main() {
             }
             #pragma omp parallel for num_threads(4) schedule(static)
             for (auto& molec: molecs) {
+                Vector2d pos_start(molec.x, molec.y);
                 molec.forward();
+                Vector2d pos_end(molec.x, molec.y);
+                if (view_mode && &molecs[info_planet_index]==&molec) [[unlikely]] {
+                    Vector2d diff = pos_end-pos_start;
+                    camx += diff.x;
+                    camy += diff.y;
+                }
                 if (!full_mode) {
                     if (molec.x<0 || molec.x>width/scale) {
                         molec.sx = -molec.sx;
@@ -1355,6 +1458,7 @@ int main() {
                         info_planet_index--;
                     } else if (info_planet_index==i) {
                         info_mode = false;
+                        view_mode = false;
                     }
                     molecs.erase(molecs.begin() + i);
                     r_cache.erase(r_cache.begin() + i);
@@ -1421,7 +1525,7 @@ int main() {
                         molecs[b].sy -= (force_to_B * dy / dist) * prediction_dt;
                     }
                 }
-
+                #pragma paralel for num_threads(4)
                 for (auto& m : molecs) {
                     double dx = m.x - simPos.x;
                     double dy = m.y - simPos.y;
@@ -1523,12 +1627,13 @@ int main() {
             renderTexture.draw(result);
         }
         if (info_mode) {
-            Molecule& molec = molecs[info_planet_index];
+            const Molecule& molec = molecs[info_planet_index];
 
             float screen_radius = std::max(molec.get_r() * scale, 2.0);
             // screen_radius += 2;
 
             sf::Vector2f screen_pos = to_coords(Vector2d(molec.x, molec.y), 0);
+            sf::Vector2f screen_pos_circle = to_coords(Vector2d(molec.x, molec.y), screen_radius/scale);
 
             // 4. Считаем скорость через твою функцию magnitude
             double v_mod = magnitude(molec.sx, molec.sy);
@@ -1552,9 +1657,26 @@ int main() {
 
             renderTexture.draw(info);
 
+            // buttons
+            const sf::Vector2f mouse_pos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+
+            auto button_view = createRoundedRect(button_view_width, button_view_height, round_buttons);
+            sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
+            button_view.setPosition(pos_button_view);
+            if (is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
+                button_view.setFillColor(sf::Color(200, 200, 200));
+            } else {
+                button_view.setFillColor(sf::Color(210, 210, 210));
+            }
+            button_view.setOutlineThickness(1.5f);
+            button_view.setOutlineColor(sf::Color(180, 180, 180));
+            renderTexture.draw(button_view);
+            auto text_view = createTextForButton((view_mode? "stop view": "view"), pos_button_view, button_view_width, button_view_height, round_buttons);
+            text_view.setFillColor(sf::Color(50, 50, 50));
+            renderTexture.draw(text_view);
+
             sf::CircleShape selector(screen_radius);
-            selector.setOrigin(screen_radius, screen_radius);
-            selector.setPosition(screen_pos);
+            selector.setPosition(screen_pos_circle);
             selector.setFillColor(sf::Color::Transparent);
             selector.setOutlineThickness(2.0f);
             selector.setOutlineColor(sf::Color::Red);
