@@ -1,4 +1,4 @@
-// cd C:/Users/Azerty/Desktop/Программы/filescpp; g++ simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32
+// cd C:/Users/Azerty/Desktop/Программы/filescpp; g++ simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32 -static -O3 -fopenmp
 #include "simulate_imports.h"
 #include <sstream>
 #include <iomanip>
@@ -86,15 +86,16 @@ inline double magn(Vector2d vec) {
     return magnitude(vec.x, vec.y);
 }
 const double strength = 6.67430e-11;
+const double sb_temperature = 5.67e-8;
 const int distance_find = 80;
-double speed = 1;
+double speed = 42*60;
 double dt = 0.016;
-double scale = 0.5;
-bool planets_mode = false;
+double scale = 0.0000333;
+bool planets_mode = true;
 int cfps = 60;
-bool full_mode = false;
-double camx;
-double camy;
+bool full_mode = true;
+double camx = 0;
+double camy = 0;
 inline auto to_coords(const Vector2d& vec, double size) {
     if (!full_mode) {
         return sf::Vector2f((vec.x-size)*scale, (vec.y-size)*scale);
@@ -109,6 +110,9 @@ inline auto from_coords(const sf::Vector2f& pixel_vec, double size) {
         return Vector2d(((pixel_vec.x-width/2) / scale) + size + camx, ((pixel_vec.y-height/2) / scale) + size + camy);
     }
 }
+const double SUN_MASS = 1.989e30;
+const double EARTH_MASS = 5.972e24;
+const double SUN_LUMINOSITY = 3.828e26;
 class Molecule {
 public:
     double x;
@@ -325,6 +329,59 @@ public:
         double f_prilive = 2*strength/1e6*other.size*this->size*radius/distCb;
         double f_grav = strength/1e6*this->size*this->size/radius/radius;
         return f_prilive-f_grav;
+    }
+    double getInternalPower() const {
+        double m_earth = this->size / 5.972e24;
+        double coreHeat = 4.7e13 * m_earth;
+        if (this->size > 1.5e29) {
+            double m_sun = this->size / 1.989e30;
+            return coreHeat + (3.828e26 * std::pow(m_sun, 3.5));
+        }
+        return coreHeat;
+    }
+
+    double getAverageAlbedo() const {
+        double m_earth = this->size / EARTH_MASS;
+        
+        if (m_earth < 0.1) return 0.1;       // Типа Луны (темный реголит)
+        if (m_earth < 2.0) return 0.3;       // Типа Земли (камни + немного облаков)
+        if (m_earth < 10.0) return 0.35;     // Суперземли
+        return 0.45;                         // Газовые гиганты (высокая отражаемость облаков)
+    }
+    double getSpecificHeat() const {
+        double m_earth = this->size / EARTH_MASS;
+
+        if (m_earth < 0.1) return 800.0;    // Мелкие астероиды, Луна (сухой камень)
+        if (m_earth < 5.0) return 1000.0;   // Планеты земного типа
+        if (m_earth < 15.0) return 2500.0;  // Нептуны / Ледяные гиганты
+        return 13000.0;                     // Газовые гиганты (водород/гелий)
+    }
+
+    double getTotalHeatCapacity() const {
+        // Считаем массу слоя глубиной h (например, 50 метров)
+        // double layerDepth = 50.0; 
+        // double density = (this->size / 5.972e24 < 10.0) ? 3000.0 : 1.3; // Камень vs Газ
+        
+        // double surfaceArea = 4.0 * M_PI * get_r() * get_r();
+        // double layerMass = surfaceArea * layerDepth * density;
+
+        // // Масса слоя не может быть больше массы всей планеты (для мелких астероидов)
+        // double effectiveMass = std::min(this->size, layerMass);
+
+        return this->size * getSpecificHeat();
+    }
+    double calc_delta_t_this(double currT) {
+        double rSq = get_r()*get_r();
+        double rSq_pi = rSq*3*M_PI*1e6;
+        return (getInternalPower()/rSq_pi-sb_temperature*currT*currT*currT*currT)*rSq_pi*speed*dt/getTotalHeatCapacity();
+    }
+    double calc_delta_t(const Molecule& star) {
+        double dx = this->x-star.x;
+        double dy = this->y-star.y;
+        double distSq = (dx*dx+dy*dy)*1e6;
+        double rSq = get_r()*get_r();
+        double rSq_pi = rSq*3*M_PI*1e6;
+        return (star.getInternalPower()*(1-getAverageAlbedo())/16/distSq)*rSq_pi*speed*dt/getTotalHeatCapacity();
     }
 };
 std::vector<Molecule> molecs;
@@ -938,6 +995,39 @@ sf::Text createTextForButton(std::string str, sf::Vector2f pos, float width, flo
 bool is_click_button(sf::Vector2f pos, sf::Vector2f size, sf::Vector2f click) {
     return pos.x<=click.x && click.x<=pos.x+size.x && pos.y<=click.y && click.y<=pos.y+size.y;
 }
+#include <chrono>
+
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <sys/sysinfo.h>
+#endif
+
+long long get_last_boot_time() {
+    auto now = std::chrono::system_clock::now();
+    auto now_sec = std::chrono::system_clock::to_time_t(now);
+
+#ifdef _WIN32
+    unsigned long long uptime_ms = GetTickCount64();
+    return now_sec - (uptime_ms / 1000);
+#else
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        return now_sec - info.uptime;
+    }
+    return 0;
+#endif
+}
+bool was_rebooted_since(long long x_time_t) {
+    long long last_boot = get_last_boot_time();
+    return last_boot > x_time_t;
+}
+bool was_rebooted_n_seconds_ago(long long seconds_passed_since_x) {
+    long long now = std::time(nullptr); 
+    long long time_x = now - seconds_passed_since_x;
+    long long last_boot = get_last_boot_time(); 
+    return last_boot > time_x;
+}
 const float padd_buttons_info = 5.0f;
 const float round_buttons = 5.0f;
 // buttons
@@ -945,6 +1035,7 @@ const float button_view_width = 80;
 const float button_view_height = 30;
 int main() {
     defaultFont.loadFromFile("C:/Windows/Fonts/arial.ttf");
+    std::vector<double> temperatures;
     molecs.resize(100);
     for (int i = 0; i!=100; i++) {
         molecs[i] = random_molec;
@@ -965,6 +1056,7 @@ int main() {
 
     bool info_mode = false;
     bool view_mode = false;
+    bool change_mass_mode = false;
     int info_planet_index = 0;
 
     bool remove_mode = false;
@@ -1004,8 +1096,12 @@ int main() {
                 sf::Vector2f screen_pos = to_coords(Vector2d(molec.x, molec.y), 0);
 
                 sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
+                sf::Vector2f pos_button_change_mass = pos_button_view+sf::Vector2f(0, padd_buttons_info+button_view_height);
                 if (info_mode && is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_posp)) {
                     view_mode = !view_mode;
+                } else if (info_mode && is_click_button(pos_button_change_mass, sf::Vector2f(button_view_width, button_view_height), mouse_posp)) {
+                    change_mass_mode = true;
+                    obj_mass = molec.size;
                 } else {
                     info_mode = true;
                     Vector2d mouse_pos = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
@@ -1022,6 +1118,7 @@ int main() {
                     if (!find) {
                         info_mode = false;
                         view_mode = false;
+                        change_mass_mode = false;
                     }
                 }
             } else if (event.type == sf::Event::MouseMoved && !remove_mode) {
@@ -1145,8 +1242,11 @@ int main() {
                         pos_obj = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
                     } else {
                         auto pos_end = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
-                        auto speed = pos_end-pos_obj;
-                        molecs.emplace_back(pos_obj.x, pos_obj.y, obj_mass, speed.x/(full_mode? 10000: 1), speed.y/(full_mode? 10000: 1), false);
+                        auto speed = (pos_end-pos_obj)/(full_mode? 10000.0: 1.0);
+                        if (view_mode) {
+                            speed += Vector2d(molecs[info_planet_index].sx, molecs[info_planet_index].sy);
+                        }
+                        molecs.emplace_back(pos_obj.x, pos_obj.y, obj_mass, speed.x, speed.y, false);
                         // std::cout << "speed2:" << magnitude(molecs[molecs.size()-1].sx, molecs[molecs.size()-1].sy) << "km/c\n";
                     }
                 } else if (event.key.code == sf::Keyboard::G) {
@@ -1159,6 +1259,7 @@ int main() {
                     distance_metr = 0;
                     remove_mode = false;
                     view_mode = false;
+                    change_mass_mode = false;
                 } else if (event.key.code == sf::Keyboard::Escape) {
                     stop_simulate = !stop_simulate;
                 } else if (event.key.code == sf::Keyboard::M) {
@@ -1289,6 +1390,7 @@ int main() {
                             if (!find) {
                                 info_mode = false;
                                 view_mode = false;
+                                change_mass_mode = false;
                             }
                         }
                     }
@@ -1305,10 +1407,16 @@ int main() {
         }
         sf::Time delta = clock.restart();
         dt = delta.asSeconds();
+        if (was_rebooted_n_seconds_ago(dt+1)) [[unlikely]] {
+            continue;
+        }
         // dt = 1.0/cfps;
         window.setTitle("Simulate (SFML) (FPS="+std::to_string(static_cast<int>(1/dt))+", Speed="+ format_sspeed(speed)+", chaos="+ format_dist(chaos)+", width="+ format_dist(width/scale) +" km)");
         if (!stop_simulate) {
             r_cache.resize(molecs.size());
+            if (temperature_snow) {
+                temperatures.resize(molecs.size(), 0);
+            }
             #pragma omp parallel for num_threads(4) schedule(static)
             for (int i = 0; i!=molecs.size(); i++) {
                 r_cache[i] = molecs[i].get_r_real();
@@ -1322,6 +1430,7 @@ int main() {
                     Vector2d diff = pos_end-pos_start;
                     camx += diff.x;
                     camy += diff.y;
+                    pos_obj += diff;
                 }
                 if (!full_mode) {
                     if (molec.x<0 || molec.x>width/scale) {
@@ -1351,7 +1460,9 @@ int main() {
                     if (molec.size<1e20) {
                         continue;
                     }
+                    int j = 0;
                     for (const auto& molec2 : molecs) {
+                        j += 1;
                         if (&molec == &molec2) continue; // Не рвем сами себя
 
                         double prilive_strenght = molec.get_prilive_strengh(molec2);
@@ -1395,8 +1506,10 @@ int main() {
 
                                     molec.size -= fragment_m;
                                     need_create.push_back(new_molec);
+                                    if (temperature_snow) {
+                                        temperatures.push_back(temperatures[j-1]);
+                                    }
                                 }
-                                // Пересчитываем радиус планеты ОДИН РАЗ после удаления всей массы
                                 m.unlock();
                             }
                         }
@@ -1439,6 +1552,9 @@ int main() {
                     colz2->sx = (colz2->sx * colz2->size + colz1->sx * colz1->size) / totalM;
                     colz2->sy = (colz2->sy * colz2->size + colz1->sy * colz1->size) / totalM;
                     
+                    if (temperature_snow) {
+                        temperatures[idx2] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())/colz1->getTotalHeatCapacity()/colz2->getTotalHeatCapacity();
+                    }
                     colz2->size = totalM;
                     destroyed[idx1] = true;
                 } 
@@ -1446,7 +1562,9 @@ int main() {
                     double totalM = colz1->size + colz2->size;
                     colz1->sx = (colz1->sx * colz1->size + colz2->sx * colz2->size) / totalM;
                     colz1->sy = (colz1->sy * colz1->size + colz2->sy * colz2->size) / totalM;
-                    
+                    if (temperature_snow) {
+                        temperatures[idx1] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())/colz1->getTotalHeatCapacity()/colz2->getTotalHeatCapacity();
+                    }
                     colz1->size = totalM;
                     destroyed[idx2] = true;
                 }
@@ -1459,19 +1577,52 @@ int main() {
                     } else if (info_planet_index==i) {
                         info_mode = false;
                         view_mode = false;
+                        change_mass_mode = false;
                     }
                     molecs.erase(molecs.begin() + i);
                     r_cache.erase(r_cache.begin() + i);
+                    if (temperature_snow) {
+                        temperatures.erase(temperatures.begin() + i);
+                    }
+                }
+            }
+            if (temperature_snow) {
+                #pragma omp parallel for num_threads(4) schedule(static)
+                for (int i = 0; i!=temperatures.size(); i++) {
+                    Molecule& planet = molecs[i];
+                    double delta = 0;
+                    for (int j = 0; j!=molecs.size(); j++) {
+                        if (i!=j) {
+                            const Molecule& star = molecs[j];
+                            delta += planet.calc_delta_t(star);
+                        }
+                    }
+                    delta += planet.calc_delta_t_this(temperatures[i]);
+                    temperatures[i] += delta;
                 }
             }
         } else if (r_cache.size()!=molecs.size()) {
-            if (r_cache.size()<molecs.size()) {
+            if (r_cache.size()>molecs.size()) {
                 std::cerr << "error recreate r_cache\n";
+                exit(1);
+            }
+            if (temperature_snow) {
+                temperatures.resize(molecs.size(), 0);
             }
             int past_size = r_cache.size();
             r_cache.resize(molecs.size());
             for (int i = past_size; i!=r_cache.size(); i++) {
                 r_cache[i] = molecs[i].get_r_real();
+            }
+        }
+        if (r_cache.size()!=temperatures.size() && temperature_snow) {
+            temperatures.resize(molecs.size(), 0);
+            // std::cerr << "err recreate temperatures ("+format_dist(r_cache.size())+","+format_dist(temperatures.size())+")" << std::endl;
+            // exit(1);
+        }
+        if (temperature_snow) {
+            for (int i = 0; i!=temperatures.size(); i++) {
+                temperatures[i] = std::min(std::max(0.0, temperatures[i]), 1000000.0);
             }
         }
         window.clear(sf::Color::White);
@@ -1496,6 +1647,9 @@ int main() {
             sf::Vector2f startPos = to_coords(pos_obj, 0);
             const Vector2d simVelS = ((Vector2d)mousePos - (Vector2d)startPos)/scale/(full_mode? 10000.0: 1.0);
             Vector2d simVel = simVelS;
+            if (view_mode) {
+                simVel += Vector2d(molecs[info_planet_index].sx, molecs[info_planet_index].sy);
+            }
             // std::cout << "speed1:" << magn(simVel) << "km/c\n";
             Vector2d simPos = pos_obj; 
             const int steps = 1000;
@@ -1552,8 +1706,13 @@ int main() {
                     m.x += m.sx * prediction_dt;
                     m.y += m.sy * prediction_dt;
                 }
-
-                trajectory[i].position = to_coords(simPos, 0);
+                if (view_mode) {
+                    Vector2d old_pos(backup_molecs[info_planet_index].x, backup_molecs[info_planet_index].y);
+                    Vector2d new_pos(molecs[info_planet_index].x, molecs[info_planet_index].y);
+                    trajectory[i].position = to_coords(simPos+old_pos-new_pos, 0);
+                } else {
+                    trajectory[i].position = to_coords(simPos, 0);
+                }
                 
                 sf::Color tColor = sf::Color::Black;
                 tColor.a = static_cast<sf::Uint8>(255 * (1.0f - (float)i / steps));
@@ -1627,7 +1786,10 @@ int main() {
             renderTexture.draw(result);
         }
         if (info_mode) {
-            const Molecule& molec = molecs[info_planet_index];
+            Molecule& molec = molecs[info_planet_index];
+            if (change_mass_mode) {
+                molec.size = obj_mass;
+            }
 
             float screen_radius = std::max(molec.get_r() * scale, 2.0);
             // screen_radius += 2;
@@ -1650,10 +1812,10 @@ int main() {
             
             // Используем format_speed и format_dist, чтобы не было "забора" из цифр
             std::string content = "V: " + format_speed(v_mod*1000) + "\n" +
-                                "M: " + format_mass(molec.size);
+                                "M: " + format_mass(molec.size)+(temperature_snow? ("\nT="+format_dist(temperatures[info_planet_index])): "");
             info.setString(content);
 
-            info.setPosition(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f);
+            info.setPosition(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f-(temperature_snow? 16.0f: 0.0f));
 
             renderTexture.draw(info);
 
@@ -1661,7 +1823,7 @@ int main() {
             const sf::Vector2f mouse_pos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
             auto button_view = createRoundedRect(button_view_width, button_view_height, round_buttons);
-            sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
+            const sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
             button_view.setPosition(pos_button_view);
             if (is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
                 button_view.setFillColor(sf::Color(200, 200, 200));
@@ -1674,6 +1836,21 @@ int main() {
             auto text_view = createTextForButton((view_mode? "stop view": "view"), pos_button_view, button_view_width, button_view_height, round_buttons);
             text_view.setFillColor(sf::Color(50, 50, 50));
             renderTexture.draw(text_view);
+
+            auto button_change_mass = createRoundedRect(button_view_width, button_view_height, round_buttons);
+            const sf::Vector2f pos_button_change_mass = pos_button_view+sf::Vector2f(0, padd_buttons_info+button_view_height);
+            button_change_mass.setPosition(pos_button_change_mass);
+            if (is_click_button(pos_button_change_mass, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
+                button_change_mass.setFillColor(sf::Color(200, 200, 200));
+            } else {
+                button_change_mass.setFillColor(sf::Color(210, 210, 210));
+            }
+            button_change_mass.setOutlineThickness(1.5f);
+            button_change_mass.setOutlineColor(sf::Color(180, 180, 180));
+            renderTexture.draw(button_change_mass);
+            auto text_change_mass = createTextForButton((change_mass_mode? "stop change mass" : "change mass"), pos_button_change_mass, button_view_width, button_view_height, round_buttons);
+            text_change_mass.setFillColor(sf::Color(50, 50, 50));
+            renderTexture.draw(text_change_mass);
 
             sf::CircleShape selector(screen_radius);
             selector.setPosition(screen_pos_circle);
@@ -1704,13 +1881,16 @@ int main() {
                     if (destroys[i]) {
                         molecs.erase(molecs.begin()+i-bias_i);
                         r_cache.erase(r_cache.begin()+i-bias_i);
+                        if (temperature_snow) {
+                            temperatures.erase(temperatures.begin()+i-bias_i);
+                        }
                         bias_i += 1;
                     }
                 }
             }
         }
 
-        if (density_snow || temperature_snow) {
+        if (!full_mode && (density_snow || temperature_snow)) {
             double density = 0;
             double temperature = 0;
             sf::RectangleShape rect(sf::Vector2f(chunk, chunk));
