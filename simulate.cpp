@@ -330,6 +330,9 @@ public:
         double f_grav = strength/1e6*this->size*this->size/radius/radius;
         return f_prilive-f_grav;
     }
+    double get_two_space(const Molecule& other) {
+        return sqrt(2*strength/1e9*this->size/(other.get_r()+get_r()));
+    }
     double getInternalPower() const {
         double m_earth = this->size / 5.972e24;
         double coreHeat = 4.7e13 * m_earth;
@@ -397,7 +400,7 @@ inline bool Molecule::is_in_cache_r() const {
     return (curr >= start && curr < end);
 }
 inline double Molecule::get_r() const {
-    if (is_in_cache_r()) {
+    if (is_in_cache_r()) [[likely]] {
         return r_cache[this - (const Molecule*)molecs.data()];
     } else {
         return get_r_real();
@@ -825,6 +828,7 @@ void drawArrow(sf::RenderTarget& target, sf::Vector2f start, sf::Vector2f end, s
     };
     target.draw(head, 4, sf::Lines);
 }
+bool destroy_mode = false;
 std::wstring helpData = 
 L"# Режимы\n"
 "* Планетный - симулируются планеты\n"
@@ -860,6 +864,7 @@ L"# Режимы\n"
 "* Shift-r - режим удаления\n"
 "* + - увеличить кисть удаления\n"
 "* - - увеличить кисть удаления\n"
+"* Shift-F - режим разрушения\n"
 "# Управление (с full):\n"
 "* колёсико мыши - приближение/отдаление из точки куда указывает мышка\n"
 ;
@@ -1279,6 +1284,8 @@ int main() {
                                 camy = width/2;
                             }
                         }
+                    } else if (event.key.shift) {
+                        destroy_mode = !destroy_mode;
                     } else {
                         int fps = getNumber("Input", "Input Fps", window);
                         if (fps>0) {
@@ -1326,7 +1333,7 @@ int main() {
                                 std::cout << "load: " << size << " objects" << std::endl;
 
                             } else {
-                                std::cerr << "I doт`t open file!" << std::endl;
+                                std::cerr << "I don`t open file!" << std::endl;
                             }
                         }
                     }
@@ -1362,7 +1369,13 @@ int main() {
                             totalEp -= G * (molecs[i].size * molecs[j].size) / dist;
                         }
                     }
-                    std::cout << "Energy:" << totalEk+totalEp << std::endl;
+                    double tempEp = 0;
+                    if (temperature_snow) {
+                        for (int i = 0; i!=molecs.size(); i++) {
+                            tempEp += molecs[i].getTotalHeatCapacity()*temperatures[i]/1e6;
+                        }
+                    }
+                    std::cout << "Energy:" << totalEk+totalEp+tempEp << std::endl;
                 } else if (event.key.code == sf::Keyboard::I) {
                     if (!event.key.shift) {
                         metr_mode = !metr_mode;
@@ -1541,32 +1554,138 @@ int main() {
                 molec.gravity_end(info);
             }
             std::vector<bool> destroyed(molecs.size(), false);
-
+            std::vector<Molecule> need_molecs;
             for (auto& [colz1, colz2] : is_collizes) {
                 int idx1 = colz1 - &molecs[0];
                 int idx2 = colz2 - &molecs[0];
-                if (destroyed[idx1] || destroyed[idx2]) continue;
+                if (idx2>=destroyed.size() || idx1>=destroyed.size() || destroyed[idx1] || destroyed[idx2]) continue;
+                double dx = colz1->sx-colz2->sx;
+                double dy = colz1->sy-colz2->sy;
+                double uSq = dx*dx+dy*dy;
 
                 if (colz1->size < colz2->size) {
                     double totalM = colz1->size + colz2->size;
                     colz2->sx = (colz2->sx * colz2->size + colz1->sx * colz1->size) / totalM;
                     colz2->sy = (colz2->sy * colz2->size + colz1->sy * colz1->size) / totalM;
                     
+                    double mass2 = colz2->size;
+                    colz2->size = totalM;
+                    double two_space = colz2->get_two_space(*colz1);
+                    double u = sqrt(uSq);
+                    double k = (destroy_mode && two_space<u)? (0.05+0.65/(1+std::pow(M_E, -2*(u/two_space-1)))): 1;
+                    colz2->size = mass2;
                     if (temperature_snow) {
-                        temperatures[idx2] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())/colz1->getTotalHeatCapacity()/colz2->getTotalHeatCapacity();
+                        temperatures[idx2] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())*k/(colz1->getTotalHeatCapacity()+colz2->getTotalHeatCapacity());
+                        temperatures[idx2] += 500000*uSq*colz1->size*colz2->size/colz2->getSpecificHeat()/totalM/totalM;
                     }
                     colz2->size = totalM;
+
                     destroyed[idx1] = true;
+                    if (destroy_mode && two_space<u) {
+                        double k_minus_mass = 0.5*(1-std::pow(M_E, -(u/two_space-1)));
+                        double minus_mass2 = mass2*(1-k_minus_mass);
+                        double minus_mass1 = colz1->size*(1-k_minus_mass);
+                        if (minus_mass2+minus_mass1<colz2->size) {
+                            double minus = 0;
+                            double dx = colz1->x-colz2->x;
+                            double dy = colz1->y-colz2->y;
+                            double dist = sqrt(dx*dx+dy*dy);
+                            double tx = dx/dist;
+                            double ty = dy/dist;
+                            double u_exit = u*sqrt(1-k);
+                            if (minus_mass1>1e20) {
+                                double u_x1 = colz2->sx-tx*u_exit*mass2/colz2->size;
+                                double u_y1 = colz2->sy-ty*u_exit*mass2/colz2->size;
+                                Molecule part1(0, 0, minus_mass1, u_x1, u_y1, false);
+                                double x1 = colz2->x-tx*(colz2->get_r()*1.01+part1.get_r());
+                                double y1 = colz2->y-ty*(colz2->get_r()*1.01+part1.get_r());
+                                part1.x = x1;
+                                part1.y = y1;
+                                need_molecs.push_back(part1);
+                                if (temperature_snow) {
+                                    temperatures.push_back(temperatures[idx2]);
+                                }
+                                minus += minus_mass1;
+                            }
+                            if (minus_mass2>1e20) {
+                                double u_x2 = colz2->sx+tx*u_exit*colz1->size/colz2->size;
+                                double u_y2 = colz2->sy+ty*u_exit*colz1->size/colz2->size;
+                                Molecule part2(0, 0, minus_mass2, u_x2, u_y2, false);
+                                double x2 = colz2->x+tx*(colz2->get_r()*1.01+part2.get_r());
+                                double y2 = colz2->y+ty*(colz2->get_r()*1.01+part2.get_r());
+                                part2.x = x2;
+                                part2.y = y2;
+                                need_molecs.push_back(part2);
+                                if (temperature_snow) {
+                                    temperatures.push_back(temperatures[idx2]);
+                                }
+                                minus += minus_mass2;
+                            }
+
+                            colz2->size -= minus;
+                        }
+                    }
                 } 
                 else {
                     double totalM = colz1->size + colz2->size;
                     colz1->sx = (colz1->sx * colz1->size + colz2->sx * colz2->size) / totalM;
                     colz1->sy = (colz1->sy * colz1->size + colz2->sy * colz2->size) / totalM;
+                    double mass1 = colz1->size;
+                    colz1->size = totalM;
+                    double two_space = colz1->get_two_space(*colz2);
+                    double u = sqrt(uSq);
+                    double k = (destroy_mode && two_space<u)? (0.05+0.65/(1+std::pow(M_E, -2*(u/two_space-1)))): 1;
+                    colz1->size = mass1;
                     if (temperature_snow) {
-                        temperatures[idx1] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())/colz1->getTotalHeatCapacity()/colz2->getTotalHeatCapacity();
+                        temperatures[idx1] = (temperatures[idx2]*colz2->getTotalHeatCapacity()+temperatures[idx1]*colz1->getTotalHeatCapacity())*k/(colz1->getTotalHeatCapacity()+colz2->getTotalHeatCapacity());
+                        temperatures[idx1] += 500000*uSq*colz1->size*colz2->size/colz1->getSpecificHeat()/totalM/totalM;
                     }
                     colz1->size = totalM;
                     destroyed[idx2] = true;
+                    if (destroy_mode && two_space<u) {
+                        double k_minus_mass = 0.5*(1-std::pow(M_E, -(u/two_space-1)));
+                        double minus_mass1 = mass1*(1-k_minus_mass);
+                        double minus_mass2 = colz2->size*(1-k_minus_mass);
+                        if (minus_mass1+minus_mass2<colz1->size) {
+                            double minus = 0;
+                            double dx = colz1->x-colz2->x;
+                            double dy = colz1->y-colz2->y;
+                            double dist = sqrt(dx*dx+dy*dy);
+                            double tx = dx/dist;
+                            double ty = dy/dist;
+                            double u_exit = u*sqrt(1-k);
+                            if (minus_mass1>1e20) {
+                                double u_x1 = colz1->sx-tx*u_exit*colz2->size/colz1->size;
+                                double u_y1 = colz1->sy-ty*u_exit*colz2->size/colz1->size;
+                                Molecule part1(0, 0, minus_mass1, u_x1, u_y1, false);
+                                double x1 = colz1->x-tx*(colz1->get_r()*1.01+part1.get_r());
+                                double y1 = colz1->y-ty*(colz1->get_r()*1.01+part1.get_r());
+                                part1.x = x1;
+                                part1.y = y1;
+                                need_molecs.push_back(part1);
+                                if (temperature_snow) {
+                                    temperatures.push_back(temperatures[idx1]);
+                                }
+                                minus += minus_mass1;
+                            }
+                            if (minus_mass2>1e20) {
+                                double u_x2 = colz1->sx+tx*u_exit*mass1/colz1->size;
+                                double u_y2 = colz1->sy+ty*u_exit*mass1/colz1->size;
+                                Molecule part2(0, 0, minus_mass2, u_x2, u_y2, false);
+                                double x2 = colz1->x+tx*(colz1->get_r()*1.01+part2.get_r());
+                                double y2 = colz1->y+ty*(colz1->get_r()*1.01+part2.get_r());
+                                part2.x = x2;
+                                part2.y = y2;
+                                need_molecs.push_back(part2);
+                                if (temperature_snow) {
+                                    temperatures.push_back(temperatures[idx1]);
+                                }
+                                minus += minus_mass2;
+                            }
+
+                            colz1->size -= minus;
+                        }
+                    }
                 }
             }
 
@@ -1585,6 +1704,9 @@ int main() {
                         temperatures.erase(temperatures.begin() + i);
                     }
                 }
+            }
+            for (const auto& molec: need_molecs) {
+                molecs.push_back(molec);
             }
             if (temperature_snow) {
                 #pragma omp parallel for num_threads(4) schedule(static)
