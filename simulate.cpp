@@ -1,5 +1,6 @@
 // cd C:/Users/Azerty/Desktop/Программы/filescpp; g++ simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32 -static -O3 -fopenmp
 #include "simulate_imports.h"
+#include "circles_lib.cpp"
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
@@ -217,11 +218,12 @@ public:
         this->x += this->sx*s_all+0.5*this->acc_x*s_all*s_all;
         this->y += this->sy*s_all+0.5*this->acc_y*s_all*s_all;
     }
-    void draw(sf::RenderTexture& r) {
+    bool draw(std::vector<CircleData>& circles, sf::VertexArray& glows, size_t count_glows, size_t count_circle) {
         double visualRadius = get_r();
-        sf::CircleShape circle(std::max(visualRadius * scale, 2.0));
+        CircleData circle(std::max(visualRadius * scale, 2.0));
 
-        circle.setPosition(to_coords(Vector2d(this->x, this->y), visualRadius));
+        //circle.setPosition(to_coords(Vector2d(this->x, this->y), visualRadius));
+        circle.setPosition(to_coords(Vector2d(this->x, this->y), 0));
         Visuals visuals;
         if (planets_mode) {
             visuals = get_object_params(this->size);
@@ -234,23 +236,34 @@ public:
         }
         
         circle.setFillColor(color);
+        bool is_use_glow = false;
         if (planets_mode && visuals.glow_factor!=0 && visualRadius*scale>=2) {
             sf::Vector2f pos = to_coords(Vector2d(this->x, this->y), 0);
-            sf::VertexArray glow(sf::TriangleFan, 32);
+            // sf::VertexArray glow(sf::TriangleFan, 32);
             sf::Color coreColor = visuals.core_color;
             sf::Color edgeColor = visuals.glow_color;
-
-            glow[0].position = pos;
-            glow[0].color = coreColor;
-
-            for (int i = 1; i < 32; ++i) {
-                float angle = i * 2 * 3.14159f / 30;
-                glow[i].position = pos + sf::Vector2f(cos(angle), sin(angle)) * (float)(visualRadius*visuals.glow_factor*scale);
-                glow[i].color = edgeColor;
+            size_t glows_id = count_glows*90;
+            // glows[glows_id].position = pos;
+            // glows[glows_id].color = coreColor;
+            float angle = -1 * 2 * 3.14159f / 30;
+            sf::Vector2f last_pos = pos + sf::Vector2f(cos(angle), sin(angle)) * (float)(visualRadius*visuals.glow_factor*scale);
+            for (int i = 0; i < 30; ++i) {
+                angle = i * 2 * 3.14159f / 30;
+                sf::Vector2f new_pos = pos + sf::Vector2f(cos(angle), sin(angle)) * (float)(visualRadius*visuals.glow_factor*scale);
+                glows[glows_id+i*3].position = new_pos;
+                glows[glows_id+i*3].color = edgeColor;
+                glows[glows_id+i*3+1].position = last_pos;
+                glows[glows_id+i*3+1].color = edgeColor;
+                glows[glows_id+i*3+2].position = pos;
+                glows[glows_id+i*3+2].color = coreColor;
+                last_pos = new_pos;
             }
-            r.draw(glow);
+            // r.draw(glow);
+            is_use_glow = true;
         }
-        r.draw(circle);
+        //r.draw(circle);
+        circles[count_circle] = circle;
+        return is_use_glow;
     }
     // inline bool is_in_cache_r() const {
     //     if (molecs.empty()) return false;
@@ -853,7 +866,6 @@ L"# Режимы\n"
 "* r - сгенерировать n рандомных объектов\n"
 "* g - сгенерировать систему\n"
 "* Control-h - вызвать это\n"
-"* Control-h - вызвать это\n"
 "* h - скрыть/показать объекты\n"
 "* a - Увеличить chaos (насколько быстро при r летают объекты)\n"
 "* Shift-a - Уменьшить chaos (насколько быстро при r летают объекты)\n"
@@ -1040,7 +1052,9 @@ const float button_view_width = 80;
 const float button_view_height = 30;
 int main() {
     defaultFont.loadFromFile("C:/Windows/Fonts/arial.ttf");
+
     std::vector<double> temperatures;
+    std::vector<CircleData> circles(100);
     molecs.resize(100);
     for (int i = 0; i!=100; i++) {
         molecs[i] = random_molec;
@@ -1073,11 +1087,9 @@ int main() {
     sf::RenderWindow window(vidioMode, "Simulate (SFML)");
     window.setFramerateLimit(30);
     sf::Clock clock;
-    sf::RenderTexture renderTexture;
-    if (!renderTexture.create(800, 600)) {
-        std::cout << ":( что-то пошло не так с GPU" << std::endl;
-        return -1;
-    }
+    circle_lib_init();
+    sf::VertexArray va_glows(sf::Triangles);
+    sf::VertexArray va_circles(sf::Triangles);
     sf::Vector2i lastMousePos;
     while (window.isOpen()) {
         sf::Event event;
@@ -1089,7 +1101,6 @@ int main() {
                 width = event.size.width;
                 height = event.size.height;
                 window.setView(sf::View(visibleArea));
-                renderTexture.create(width, height);
                 clock.restart();
             } else if (event.type == sf::Event::MouseButtonPressed && !remove_mode) {
                 const sf::Vector2f mouse_posp = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -1748,11 +1759,31 @@ int main() {
             }
         }
         window.clear(sf::Color::White);
-        renderTexture.clear(sf::Color::White);
         if (!hide_molecs) {
-            for (auto molec: molecs) {
-                molec.draw(renderTexture);
+            circles.resize(molecs.size());
+            size_t count_circle = 0;
+            size_t count_glows = 0;
+            size_t atmosfere_count = 0;
+            if (planets_mode) {
+                for (const auto& molec: molecs) {
+                    double visualRadius = molec.get_r();
+                    if (get_object_params(molec.size).glow_factor!=0.0 && visualRadius*scale>=2) {
+                        atmosfere_count++;
+                    }
+                }
             }
+            va_glows.resize(atmosfere_count*90);
+            for (auto molec: molecs) {
+                if (molec.draw(circles, va_glows, count_glows, count_circle)) {
+                    count_glows++;
+                }
+                count_circle++;
+
+            }
+            //std::cout << atmosfere_count << " " << count_glows << std::endl;
+            window.draw(va_glows);
+            draw_circles(window, circles, va_circles);
+
         }
         if (create_mode) {
             double size = Molecule(0,0, obj_mass, 0,0, false).get_r();
@@ -1764,7 +1795,7 @@ int main() {
             } else {
                 shape.setFillColor(sf::Color::Blue);
             }
-            renderTexture.draw(shape);
+            window.draw(shape);
             sf::Vector2f mousePos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
             sf::Vector2f startPos = to_coords(pos_obj, 0);
             const Vector2d simVelS = ((Vector2d)mousePos - (Vector2d)startPos)/scale/(full_mode? 10000.0: 1.0);
@@ -1842,14 +1873,14 @@ int main() {
             }
 
             molecs = backup_molecs;
-            renderTexture.draw(trajectory);
+            window.draw(trajectory);
 
             sf::VertexArray line(sf::Lines, 2);
             line[0].position = to_coords(pos_obj, 0);
             line[0].color = sf::Color::Green;
             line[1].position = mousePos;
             line[1].color = sf::Color::Green;
-            renderTexture.draw(line);
+            window.draw(line);
 
             sf::Text text;
             text.setFont(defaultFont);
@@ -1857,7 +1888,7 @@ int main() {
             text.setCharacterSize(20);
             text.setPosition(to_coords(pos_obj, 0)+sf::Vector2f(40,40));
             text.setString(format_speed(magn(simVelS)*1000));
-            renderTexture.draw(text);
+            window.draw(text);
         }
         if (metr_mode) {
             const int size_point = 5;
@@ -1866,17 +1897,17 @@ int main() {
             line[0].color = sf::Color(0, 0, 0, 150);
             line[1].position = window.mapPixelToCoords(sf::Mouse::getPosition(window));
             line[1].color = sf::Color(0, 0, 0, 150);
-            renderTexture.draw(line);
+            window.draw(line);
 
             sf::CircleShape point1(size_point);
             point1.setFillColor(sf::Color::Green);
             point1.setPosition(to_coords(start_pos_metr, size_point/scale));
-            renderTexture.draw(point1);
+            window.draw(point1);
 
             sf::CircleShape point2(size_point);
             point2.setFillColor(sf::Color::Green);
             point2.setPosition(window.mapPixelToCoords(sf::Mouse::getPosition(window))-sf::Vector2f(size_point, size_point));
-            renderTexture.draw(point2);
+            window.draw(point2);
         } else if (distance_metr!=0) {
             const int size_point = 5;
             sf::VertexArray line(sf::Lines, 2);
@@ -1884,17 +1915,17 @@ int main() {
             line[0].color = sf::Color(0, 0, 0, 150);
             line[1].position = to_coords(end_pos_metr, 0);
             line[1].color = sf::Color(0, 0, 0, 150);
-            renderTexture.draw(line);
+            window.draw(line);
 
             sf::CircleShape point1(size_point);
             point1.setFillColor(sf::Color::Green);
             point1.setPosition(to_coords(start_pos_metr, size_point/scale));
-            renderTexture.draw(point1);
+            window.draw(point1);
 
             sf::CircleShape point2(size_point);
             point2.setFillColor(sf::Color::Green);
             point2.setPosition(to_coords(end_pos_metr, size_point/scale));
-            renderTexture.draw(point2);
+            window.draw(point2);
 
             sf::Text result;
             result.setFont(defaultFont);
@@ -1905,7 +1936,7 @@ int main() {
             result.setOrigin(textRect.left + textRect.width / 2.0f, 
                             textRect.top  + textRect.height / 2.0f);
             result.setPosition(((to_coords(start_pos_metr, 0)+to_coords(end_pos_metr, 0))/(float)2)+sf::Vector2f(0, -25));
-            renderTexture.draw(result);
+            window.draw(result);
         }
         if (info_mode) {
             Molecule& molec = molecs[info_planet_index];
@@ -1923,7 +1954,7 @@ int main() {
             double v_mod = magnitude(molec.sx, molec.sy);
 
             if (v_mod>10 || full_mode) {
-                drawArrow(renderTexture, to_coords(Vector2d(molec.x, molec.y), 0), to_coords(Vector2d(molec.x+molec.sx*(full_mode? 1000: 1), molec.y+molec.sy*(full_mode? 1000: 1)), 0), sf::Color::Cyan);
+                drawArrow(window, to_coords(Vector2d(molec.x, molec.y), 0), to_coords(Vector2d(molec.x+molec.sx*(full_mode? 1000: 1), molec.y+molec.sy*(full_mode? 1000: 1)), 0), sf::Color::Cyan);
             }
 
             // 5. Подготовка текста
@@ -1939,7 +1970,7 @@ int main() {
 
             info.setPosition(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f-(temperature_snow? 16.0f: 0.0f));
 
-            renderTexture.draw(info);
+            window.draw(info);
 
             // buttons
             const sf::Vector2f mouse_pos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -1954,10 +1985,10 @@ int main() {
             }
             button_view.setOutlineThickness(1.5f);
             button_view.setOutlineColor(sf::Color(180, 180, 180));
-            renderTexture.draw(button_view);
+            window.draw(button_view);
             auto text_view = createTextForButton((view_mode? "stop view": "view"), pos_button_view, button_view_width, button_view_height, round_buttons);
             text_view.setFillColor(sf::Color(50, 50, 50));
-            renderTexture.draw(text_view);
+            window.draw(text_view);
 
             auto button_change_mass = createRoundedRect(button_view_width, button_view_height, round_buttons);
             const sf::Vector2f pos_button_change_mass = pos_button_view+sf::Vector2f(0, padd_buttons_info+button_view_height);
@@ -1969,23 +2000,23 @@ int main() {
             }
             button_change_mass.setOutlineThickness(1.5f);
             button_change_mass.setOutlineColor(sf::Color(180, 180, 180));
-            renderTexture.draw(button_change_mass);
+            window.draw(button_change_mass);
             auto text_change_mass = createTextForButton((change_mass_mode? "stop change mass" : "change mass"), pos_button_change_mass, button_view_width, button_view_height, round_buttons);
             text_change_mass.setFillColor(sf::Color(50, 50, 50));
-            renderTexture.draw(text_change_mass);
+            window.draw(text_change_mass);
 
             sf::CircleShape selector(screen_radius);
             selector.setPosition(screen_pos_circle);
             selector.setFillColor(sf::Color::Transparent);
             selector.setOutlineThickness(2.0f);
             selector.setOutlineColor(sf::Color::Red);
-            renderTexture.draw(selector);
+            window.draw(selector);
         }
         if (remove_mode) {
             sf::CircleShape remove_zone(remove_size*scale);
             remove_zone.setPosition(window.mapPixelToCoords(sf::Mouse::getPosition(window))-sf::Vector2f(remove_size*scale, remove_size*scale));
             remove_zone.setFillColor(sf::Color(255, 0, 0, 150));
-            renderTexture.draw(remove_zone);
+            window.draw(remove_zone);
             if (sf::Mouse::isButtonPressed(sf::Mouse::Left)) {
                 Vector2d pos = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
                 bool destroys[molecs.size()];
@@ -2071,7 +2102,7 @@ int main() {
                             //m.lock();
                             rect.setPosition(sf::Vector2f(x, y));
                             rect.setFillColor(col);
-                            renderTexture.draw(rect);
+                            window.draw(rect);
                             //m.unlock();
                         }
                     }
@@ -2097,17 +2128,16 @@ int main() {
                             //m.lock();
                             rect.setPosition(sf::Vector2f(x, y));
                             rect.setFillColor(col);
-                            renderTexture.draw(rect);
+                            window.draw(rect);
                             //m.unlock();
                         }
                     }
                 }
             }
         }
-        renderTexture.display();
-        sf::Sprite resultSprite(renderTexture.getTexture());
-        resultSprite.setPosition(sf::Vector2f(0,0));
-        window.draw(resultSprite);
+        // renderTexture.display();
+        // sf::Sprite resultSprite(renderTexture.getTexture());
+        // resultSprite.setPosition(sf::Vector2f(0,0));
         window.display();
     }   
 }
