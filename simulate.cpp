@@ -1,10 +1,70 @@
-// cd C:/Users/Azerty/Desktop/Программы/filescpp; g++ simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32 -static -O3 -fopenmp
+// g++:     cd C:/Users/Azerty/Desktop/Программы/filescpp; g++ simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32 -static -O3 -fopenmp
+// clang++: cd C:/Users/Azerty/Desktop/Программы/filescpp ; C:\Users\Azerty\AppData\Local\Android\Sdk\ndk\28.2.13676358\toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe --target=x86_64-w64-mingw32 simulate.cpp -o simulate.exe -I c:\Users\Azerty\Downloads\SFML-2.6.1/include -L c:\Users\Azerty\Downloads\SFML-2.6.1/lib -I C:\Users\Azerty\Downloads\mingw64\include -L C:\Users\Azerty\Downloads\mingw64\lib -lsfml-graphics-d -lsfml-window-d -lsfml-system-d -lopengl32 -lwinmm -lgdi32 -lcomdlg32 -static -O3 -march=native -ffast-math -ffp-contract=fast -funroll-loops -fopenmp=libgomp -lgomp -lwinpthread -fopenmp
 #include "simulate_imports.h"
 #include "circles_lib.cpp"
 #include <sstream>
 #include <iomanip>
 #include <filesystem>
 #include <cstdio>
+#include <omp.h>
+#include <cstring>
+#include <chrono>
+#include <immintrin.h>
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <sys/sysinfo.h>
+#endif
+#include "gpu_loader.cpp" // загружает gpu функции и имеет свои функции
+#include "settings_lib.cpp" // для настроек
+bool gpu_mode = false;
+// если что-то добавляется - добавлять в конец
+// не меняйте порядок
+std::vector<Setting> settings = {
+    {
+        "gpu_mode",
+        "Включает или выключает вычисления через видеокарту (требует перезапуск).",
+        SettingType::Bool,
+        InputType::Checkbox,
+        "false", // Текущее значение
+        "false", // Значение по умолчанию
+        true,    // Нужен перезапуск
+        false,   // Флаг изменения (is_dirty)
+        32,      // Разрядность в битах
+        0, 0,    // Мин/Макс (не используются для bool)
+        {}       // Варианты выбора (нет)
+    },
+    {
+        "Показ атмосферы планет",
+        "Включает или выключает визуальное отображение атмосферных эффектов вокруг планет.",
+        SettingType::Bool,
+        InputType::YesNo,
+        "true",
+        "true",
+        false,   // Применяется мгновенно, перезапуск не нужен
+        false,
+        32,
+        0, 0,
+        {}
+    },
+    {
+        "Потоки видеокарты", // Имя в меню
+        "Задаёт производительность. рекоминдуется ставить 16-32 с слабой видиокартой и 32+ с мощной (чтоб\n быстрее было)", // Кастомное описание
+        SettingType::Number,   // Тип данных: числовой (int)
+        InputType::Slider,     // Интерфейс: ползунок (слайдер)
+        "16",                 // Текущее выбранное значение
+        "16",                 // Заводской дефолт при сбросе настроек
+        true,                  // Требует перезапуск: ДА (изменение потоков видеопамяти требует реинициализации контекста)
+        false,                 // По умолчанию не изменено
+        16,                    // Разрядность: 16 бит. При записи в файл превратится ровно в 4 HEX-символа (256 -> '0100')
+        0, 0,                  // Диапазон min/max игнорируется, так как ниже передан жесткий список options
+        {"8", "16", "32", "64", "128", "256", "512", "1024"} // Ограничение выбора: ползунок прыгает строго по этим числам
+    }
+};
+const std::string setup_path = "settings.save";
+#define gpu_mode_sett_id 0
+#define show_atmosphere_sett_id 1
+#define gpu_num_threads_sett_id 2
 // #include "gpu_loader.cpp"
 //in_simulate_imports:
 // #include <SFML/Graphics.hpp>
@@ -87,6 +147,7 @@ inline double magn(Vector2d vec) {
     return magnitude(vec.x, vec.y);
 }
 const double strength = 6.67430e-11;
+const double G_km = 6.67430e-20;
 const double sb_temperature = 5.67e-8;
 const int distance_find = 80;
 double speed = 42*60;
@@ -163,7 +224,6 @@ public:
             const double base = (this->size+other.size)*1.5+1;
             distance++;
             if (distance<base) {
-                
                 distance = -(base-distance+1);
             }
             
@@ -181,9 +241,9 @@ public:
         // this->acc_x += force * dx/distance;
         // this->acc_y += force * dy/distance;
         double inv = 1.0/distance;
-        const double directionx = (other.x-this->x)*inv;
-        const double directiony = (other.y-this->y)*inv;
-        const double ratio_mass = (other.size*strength/1e9)*inv*inv;
+        const double directionx = dx*inv;
+        const double directiony = dy*inv;
+        const double ratio_mass = (other.size*G_km)*inv*inv;
         //std::scoped_lock lock(m);
         this->acc_x += directionx*ratio_mass;
         // this->sx += sin(direction)*strength*ratio_mass*dt*speed/distance;
@@ -191,19 +251,41 @@ public:
         // this->sy += cos(direction)*strength*ratio_mass*dt*speed/distance;
         return false;
     }
-    std::pair<double, double> gravity_start() {
+    bool attract_opt(const Molecule& other) {
+        const double dx = other.x-this->x;
+        const double dy = other.y-this->y;
+        double distanceSq = dx*dx+dy*dy;
+        double distanceSq_inv = 1.0/distanceSq;
+        double distance_inv = sqrt(distanceSq_inv);
+
+        const double directionx = dx*distance_inv;
+        const double directiony = dy*distance_inv;
+        const double force = (other.size*G_km)*distanceSq_inv;
+        this->acc_x += directionx*force;
+        this->acc_y += directiony*force;
+        return false;
+    }
+    inline std::pair<double, double> gravity_start() {
         double acc_x_past = this->acc_x;
         double acc_y_past = this->acc_y;
         this->acc_x = 0;
         this->acc_y = 0;
         return {acc_x_past, acc_y_past};
     }
-    void gravity_end(std::pair<double, double> past_acc) {
+    inline void gravity_end(std::pair<double, double> past_acc) {
         // это Эйлер (ошибки на маленьком dt огромны)
         // this->sx += this->acc_x*speed*dt;
         // this->sy += this->acc_y*speed*dt;
         // а это Верле (точнее)
         double calc = speed*dt;
+        this->sx += 0.5*(this->acc_x+past_acc.first)*calc;
+        this->sy += 0.5*(this->acc_y+past_acc.second)*calc;
+    }
+    inline void gravity_end(std::pair<double, double> past_acc, double calc) {
+        // это Эйлер (ошибки на маленьком dt огромны)
+        // this->sx += this->acc_x*speed*dt;
+        // this->sy += this->acc_y*speed*dt;
+        // а это Верле (точнее)
         this->sx += 0.5*(this->acc_x+past_acc.first)*calc;
         this->sy += 0.5*(this->acc_y+past_acc.second)*calc;
     }
@@ -215,10 +297,19 @@ public:
         // this->y += this->sy*dt*speed;
         // а это Верле
         double s_all = dt*speed;
-        this->x += this->sx*s_all+0.5*this->acc_x*s_all*s_all;
-        this->y += this->sy*s_all+0.5*this->acc_y*s_all*s_all;
+        double s_allSq = s_all*s_all;
+        this->x += this->sx*s_all+0.5*this->acc_x*s_allSq;
+        this->y += this->sy*s_all+0.5*this->acc_y*s_allSq;
     }
-    bool draw(std::vector<CircleData>& circles, sf::VertexArray& glows, size_t count_glows, size_t count_circle) {
+    inline void forward(double s_all, double s_allSq) {
+        // это Эйлер
+        // this->x += this->sx*s_all;
+        // this->y += this->sy*s_all;
+        // а это Верле
+        this->x += this->sx*s_all+0.5*this->acc_x*s_allSq;
+        this->y += this->sy*s_all+0.5*this->acc_y*s_allSq;
+    }
+    bool draw(std::vector<CircleData>& circles, sf::VertexArray& glows, size_t count_glows, size_t count_circle) const {
         double visualRadius = get_r();
         CircleData circle(std::max(visualRadius * scale, 2.0));
 
@@ -237,7 +328,7 @@ public:
         
         circle.setFillColor(color);
         bool is_use_glow = false;
-        if (planets_mode && visuals.glow_factor!=0 && visualRadius*scale>=2) {
+        if (planets_mode && settings[show_atmosphere_sett_id].get_value<bool>() && visuals.glow_factor!=0 && visualRadius*scale>=2) {
             sf::Vector2f pos = to_coords(Vector2d(this->x, this->y), 0);
             // sf::VertexArray glow(sf::TriangleFan, 32);
             sf::Color coreColor = visuals.core_color;
@@ -339,8 +430,10 @@ public:
         double dy = this->y-other.y;
         double distSq = dx*dx+dy*dy;
         double distCb = distSq*sqrt(distSq);
-        double f_prilive = 2*strength/1e6*other.size*this->size*radius/distCb;
-        double f_grav = strength/1e6*this->size*this->size/radius/radius;
+        double radius_inv = 1.0/radius;
+        double ss = strength/1e6*this->size;
+        double f_prilive = 2*ss*other.size*radius/distCb;
+        double f_grav = ss*this->size*radius_inv*radius_inv;
         return f_prilive-f_grav;
     }
     double get_two_space(const Molecule& other) {
@@ -498,6 +591,7 @@ int getNumber(const std::string& title, const std::string& content, sf::RenderWi
         input_window.display();
         //mainWindow.display();
     }
+    mainWindow.setActive(true);
     if (input_string == "") {
         return -1;
     }
@@ -572,6 +666,7 @@ double getDouble(const std::string& title, const std::string& content, sf::Rende
         input_window.display();
         //mainWindow.display();
     }
+    mainWindow.setActive(true);
     if (input_string == "") {
         return -1;
     }
@@ -580,62 +675,6 @@ double getDouble(const std::string& title, const std::string& content, sf::Rende
     } catch (std::exception& _) {
         return -1;
     }
-}
-void generateCosmos(std::vector<Molecule>& molecs, double width, double height, sf::RenderWindow& window) {
-    int density = getNumber("Density", "1: Sparse, 2: Normal, 3: Chaos", window);
-    if (density <= 0) density = 1;
-    srand(getNumber("Seed", "Enter seed:", window));
-
-    molecs.clear();
-    const double G = 6.6743e-20; 
-
-    // Разбрасываем системы по огромному полю (теперь это реально космос)
-    int numSystems = (int)((width * height) / 5e6) * density;
-    if (numSystems < 1) numSystems = 1;
-
-    for (int s = 0; s < numSystems; ++s) {
-        double marginX = width * 0.3;
-        double marginY = height * 0.3;
-
-        // Диапазон для рандома: от margin до (width - margin)
-        double centerX = marginX + (rand() % (int)(width - 2 * marginX));
-        double centerY = marginY + (rand() % (int)(height - 2 * marginY));
-        
-        // ЗВЕЗДА (Умеренная, чтобы не ломать dt)
-        double starMass = 1e25+(rand()%20)*1e25;
-
-        molecs.push_back({centerX, centerY, starMass, 0, 0, false});
-
-        // ПЛАНЕТЫ на ДИСТАНЦИИ (в километрах)
-        // int planetsCount = 2 + (rand() % 3);
-        int planetsCount = 1;
-        for (int p = 0; p < planetsCount; ++p) {
-            // Расстояние от 2000 до 8000 км (теперь они не "трутся" боками)
-            double r = 200.0 + (p * 200) + (rand() % 20); 
-            double angle = (rand() % 360) * 3.1415 / 180.0;
-            
-            double m = 1e22+(rand()%50)*1e22;
-            // v = sqrt(G * M / r) — теперь r адекватный
-            double vOrb = sqrt((G/1000000000) * (starMass + m)  / r);
-
-            double px = centerX + r * cos(angle);
-            double py = centerY + r * sin(angle);
-            double pvx = -sin(angle) * vOrb;
-            double pvy =  cos(angle) * vOrb;
-            // double pvy = 0 - sin(angle) * vOrb;
-            // double pvx = 0 + cos(angle) * vOrb;
-            std::cout << vOrb << std::endl;
-
-            molecs.push_back({px, py, m, pvx, pvy, false}); // Планета 10^12 кг
-        }
-    }
-
-    // // АСТЕРОИДЫ (Рассыпаны далеко)
-    // for (int a = 0; a < 20 * density; ++a) {
-    //     double x = (rand() % (int)width);
-    //     double y = (rand() % (int)height);
-    //     molecs.push_back({x, y, 1e12+(rand()%1000)*1e12, (rand()%200-100)/500.0, (rand()%200-100)/500.0, false});
-    // }
 }
 std::optional<std::string> SaveFile(const sf::RenderWindow& window) {
     // Используем char (узкие символы)
@@ -864,7 +903,6 @@ L"# Режимы\n"
 "* Right - Ускорить время\n"
 "* l - показать информацию о симуляции в консоль (кол-во об., ср. x, ср. y, энерия)\n"
 "* r - сгенерировать n рандомных объектов\n"
-"* g - сгенерировать систему\n"
 "* Control-h - вызвать это\n"
 "* h - скрыть/показать объекты\n"
 "* a - Увеличить chaos (насколько быстро при r летают объекты)\n"
@@ -877,8 +915,20 @@ L"# Режимы\n"
 "* + - увеличить кисть удаления\n"
 "* - - увеличить кисть удаления\n"
 "* Shift-F - режим разрушения\n"
+"* o - открыть настройки\n"
 "# Управление (с full):\n"
 "* колёсико мыши - приближение/отдаление из точки куда указывает мышка\n"
+"* нажатие - выделить планету (тогда ещё можно будет проследить, изменить её массу)/сбросить выделение\n"
+"* перемещение мыши с зажатой левой кнопкой мыши  - переместиться\n"
+"* на тачпаде 2 пальца в какую-то сторону переместить - переместиться\n"
+"* на тачпаде 2 пальца в стороны/друг к другу переместить - приблизить/отдалить\n"
+"# Оптимизация:\n"
+"на среднем ноутбуке:\n"
+"* С cpu будет 36-37 fps на 2000 объектов\n"
+"* С gpu на встроеной intel видиокарте будет 17-19 fps на 2000 объектов (в 16 потоков на ядро как по умолчанию)\n"
+"* С gpu на встроеной intel видиокарте будет 11 fps на 2000 объектов (в 64 потоков на ядро)\n"
+"* С gpu от amd лучше ставить 32 потока а не 16 потоков на ядро (меняется в настройках)\n"
+"* Отрисовка не сильно снижает fps\n"
 ;
 void showHelp() {
     sf::RenderWindow helpWindow(sf::VideoMode(640, 480), L"Справка", sf::Style::Titlebar | sf::Style::Close);
@@ -1012,13 +1062,6 @@ sf::Text createTextForButton(std::string str, sf::Vector2f pos, float width, flo
 bool is_click_button(sf::Vector2f pos, sf::Vector2f size, sf::Vector2f click) {
     return pos.x<=click.x && click.x<=pos.x+size.x && pos.y<=click.y && click.y<=pos.y+size.y;
 }
-#include <chrono>
-
-#ifdef _WIN32
-    #include <windows.h>
-#else
-    #include <sys/sysinfo.h>
-#endif
 
 long long get_last_boot_time() {
     auto now = std::chrono::system_clock::now();
@@ -1050,8 +1093,297 @@ const float round_buttons = 5.0f;
 // buttons
 const float button_view_width = 80;
 const float button_view_height = 30;
+#if defined(__GNUC__) || defined(__clang__)
+    // Отключение для GCC и Clang
+    #pragma GCC diagnostic ignored "-Wwrite-strings"
+#elif defined(_MSC_VER)
+    // Отключение для Visual Studio (MSVC)
+    #pragma warning(disable : 4267) // Отключает связанные предупреждения приведения типов
+#endif
+char* gravSourse = R"(#version 430 core
+// Включаем поддержку double для встроек
+#extension GL_ARB_compute_shader : enable
+#extension GL_ARB_shader_storage_buffer_object : enable
+#extension GL_ARB_gpu_shader_fp64 : enable
+//#extension GL_EXT_control_flow_attributes : enable
+
+// 16 - лучше всего
+layout(local_size_x = GPU_THREADS) in;
+
+struct Molecule {
+    double x, y;
+    double vx, vy;
+    double acc_x;
+    double acc_y;
+    double mass;
+    double padd;
+};
+struct Collize {
+    uint idx1;
+    uint idx2;
+};
+
+layout(std430, binding = 0) buffer MolecBuffer {
+    Molecule molecs[];
+};
+layout(std430, binding = 1) buffer RadiusBuffer {
+    double r_cache[];
+};
+layout(std430, binding = 2) buffer CollizeBuffer {
+    Collize collizes[];
+};
+layout(std430, binding = 3) buffer CollizeCBuffer {
+    uint count_coliz[];
+};
+
+uniform double dt;
+uniform uint total;
+//const double G = 6.67430e-20; // для старого кода с double
+const vec2 G = vec2(6.6743003e-20, -3.111812e-27);
+// double - медлено. но есть float но он не точный - тогда 2 float чтоб было точнее (в итоге в 4-8 раз быстрее double)
+// Перевод обратно из эмулированного vec2 (High/Low) в честный double
+double vec2ToDouble(vec2 val) {
+    return double(val.x) + double(val.y); // Просто складываем компоненты в double
+}
+vec2 ds_add(vec2 a, vec2 b) {
+    float t1 = a.x + b.x;
+    float e = t1 - a.x;
+    float t2 = ((b.x - e) + (a.x - (t1 - e))) + a.y + b.y;
+    
+    // Возвращаем новую пару high и low
+    float high = t1 + t2;
+    float low = t2 - (high - t1);
+    return vec2(high, low);
+}
+vec2 ds_sub(vec2 a, vec2 b) {
+    // Вычитаем старшие части
+    float s1 = a.x - b.x;
+    float e = s1 - a.x;
+    // Вычисляем точную погрешность вычитания старших частей и добавляем младшие
+    float s2 = ((-b.x - e) + (a.x - (s1 - e))) + a.y - b.y;
+    
+    float high = s1 + s2;
+    float low = s2 - (high - s1);
+    return vec2(high, low);
+}
+vec2 twoproduct(float a, float b) {
+    float p = a * b;
+    // Разделяем числа на старшие и младшие биты, чтобы найти точную ошибку умножения
+    float c = 4097.0 * a;
+    float a_h = c - (c - a);
+    float a_l = a - a_h;
+    
+    c = 4097.0 * b;
+    float b_h = c - (c - b);
+    float b_l = b - b_h;
+    
+    float err = ((a_h * b_h - p) + a_h * b_l + a_l * b_h) + a_l * b_l;
+    return vec2(p, err);
+}
+
+// --- УМНОЖЕНИЕ двух эмулированных double (A * B) ---
+vec2 ds_mul(vec2 a, vec2 b) {
+    vec2 p = twoproduct(a.x, b.x);
+    p.y += a.x * b.y;
+    p.y += a.y * b.x;
+    
+    float high = p.x + p.y;
+    float low = p.y - (high - p.x);
+    return vec2(high, low);
+}
+
+// --- ДЕЛЕНИЕ двух эмулированных double (A / B) ---
+vec2 ds_div(vec2 a, vec2 b) {
+    float q1 = a.x / b.x;
+    vec2 p = twoproduct(q1, b.x);
+    
+    float r = a.x - p.x;
+    r -= p.y;
+    r += a.y;
+    r -= q1 * b.y;
+    
+    float q2 = r / b.x;
+    float high = q1 + q2;
+    float low = q2 - (high - q1);
+    return vec2(high, low);
+}
+vec2 ds_inversesqrt(vec2 a) {
+    // Шаг 1: Получаем грубое начальное приближение (точность float)
+    float x0 = inversesqrt(a.x);
+    
+    // Шаг 2: Итерация Ньютона-Рафсона для Double-Single точности.
+    // Формула: x1 = x0 * (1.5 - 0.5 * a * x0 * x0)
+    
+    // Считаем: 0.5 * a
+    vec2 half_a = vec2(0.5 * a.x, 0.5 * a.y);
+    
+    // Считаем: x0 * x0
+    vec2 x0Sq = vec2(x0 * x0, 0.0);
+    
+    // Считаем: 0.5 * a * x0 * x0
+    vec2 term = ds_mul(half_a, x0Sq);
+    
+    // Считаем: 1.5 - term
+    vec2 one_point_five = vec2(1.5, 0.0);
+    vec2 factor = ds_sub(one_point_five, term);
+    
+    // Итоговое значение x1 = x0 * factor
+    vec2 x1 = ds_mul(vec2(x0, 0.0), factor);
+    
+    return x1; // Возвращает точный 1.0 / sqrt(A) в формате vec2
+}
+vec2 doubleToVec2(double val) {
+    // 1. Распаковываем double на два 32-битных uint (младшие и старшие 32 бита)
+    uvec2 bits = unpackDouble2x32(val);
+    
+    // 2. Сбрасываем (зануляем) нижние 12 бит мантиссы у младшего слова.
+    // Это мгновенно и чисто «отрезает» хвост точности на уровне железа
+    uint low_bits_cleared = bits.x & 0xFFFFF000u;
+    
+    // 3. Собираем старшую часть (High) обратно в double и приводим к float
+    float high = float(packDouble2x32(uvec2(low_bits_cleared, bits.y)));
+    
+    // 4. Младшая часть — это просто остаток. 
+    // Для видеокарты такое вычитание СЕЙЧАС будет быстрым, 
+    // так как у high занулен хвост, и операция оптимизируется на конвейере.
+    float low = float(val - double(high)); 
+    
+    return vec2(high, low);
+}
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= total) return; // Защита от выхода за пределы массива
+
+    vec2 dt_v2 = doubleToVec2(dt);
+
+    vec2 p_ix = doubleToVec2(molecs[i].x);
+    vec2 p_iy = doubleToVec2(molecs[i].y);
+    //vec2 m_i = doubleToVec2(molecs[i].mass);
+
+    vec2 accX = vec2(0.0, 0.0);
+    vec2 accY = vec2(0.0, 0.0);
+
+    for (uint j = 0; j < total; j++) {
+        if (i == j) continue;
+
+        vec2 dx = ds_sub(doubleToVec2(molecs[j].x),  p_ix);
+        vec2 dy = ds_sub(doubleToVec2(molecs[j].y), p_iy);
+
+        vec2 distSq = ds_add(ds_mul(dx, dx), ds_mul(dy, dy));
+        
+        // скорость за точность (но теперь даже быстрее без сильной потери точности)
+        vec2 dist_inv = ds_inversesqrt(distSq);
+        vec2 dist = ds_mul(dist_inv, distSq); 
+        //double dist = sqrt(distSq);
+        //double dist_inv = 1.0/dist;
+
+        // vec2 force = (G * molecs[j].mass) * dist_inv * dist_inv;
+        vec2 force = ds_mul(ds_mul(G, doubleToVec2(molecs[j].mass)), ds_mul(dist_inv, dist_inv));
+
+        // Проекция ускорения: a = F * (d / r) -> force * d * dist_inv
+        //accX += force * dx * dist_inv;
+        //accY += force * dy * dist_inv;
+        accX = ds_add(accX, ds_mul(force, ds_mul(dx, dist_inv)));
+        accY = ds_add(accY, ds_mul(force, ds_mul(dy, dist_inv)));
+
+        if (dist.x < float(r_cache[i]) + float(r_cache[j])) {
+            uint index = atomicAdd(count_coliz[0], 1);
+            if (index < total * 6) {
+                collizes[index].idx1 = i;
+                collizes[index].idx2 = j;
+            }
+        }
+    }
+    vec2 p_accx = doubleToVec2(molecs[i].acc_x);
+    vec2 p_accy = doubleToVec2(molecs[i].acc_y);
+    //double new_x = p_ix + molecs[i].vx * dt + 0.5 * molecs[i].acc_x * dt * dt;
+    //double new_y = p_iy + molecs[i].vy * dt + 0.5 * molecs[i].acc_y * dt * dt;
+    double new_x = vec2ToDouble(ds_add(ds_add(p_ix, ds_mul(doubleToVec2(molecs[i].vx), dt_v2)), ds_mul(ds_mul(vec2(0.5, 0.0), ds_mul(p_accx, dt_v2)), dt_v2)));
+    double new_y = vec2ToDouble(ds_add(ds_add(p_iy, ds_mul(doubleToVec2(molecs[i].vy), dt_v2)), ds_mul(ds_mul(vec2(0.5, 0.0), ds_mul(p_accy, dt_v2)), dt_v2)));
+
+    //molecs[i].vx += 0.5 * (accX + molecs[i].acc_x) * dt;
+    //molecs[i].vy += 0.5 * (accY + molecs[i].acc_y) * dt;
+    molecs[i].vx += vec2ToDouble(ds_mul(vec2(0.5, 0), ds_mul(ds_add(accX, p_accx), dt_v2)));
+    molecs[i].vy += vec2ToDouble(ds_mul(vec2(0.5, 0), ds_mul(ds_add(accY, p_accy), dt_v2)));
+
+    molecs[i].x = new_x;
+    molecs[i].y = new_y;
+    molecs[i].acc_x = vec2ToDouble(accX);
+    molecs[i].acc_y = vec2ToDouble(accY);
+}
+)";
+// вызывайте когда хоть что-нибудь изменилось в planets
+// синхронизирует данные с видиокартой
+// но r_cache обновляйте сами и до вызова этой функции
+// но если вы изменили только массу одного объекта или вы изменили позицию только одного объекта делайте сами
+void changePlanets(size_t& ssbo_planets_size, GLuint& ssbo_count_colz, GLuint& ssbo_planets, GLuint& ssbo_r_cache, GLuint& ssbo_collizes, bool change_mass) {
+    if (!gpu_mode) {
+        return;
+    }
+    if (ssbo_planets_size!=molecs.size()) {
+        if (ssbo_planets!=0) {
+            deleteSSBO(ssbo_planets);
+            deleteSSBO(ssbo_r_cache);
+            deleteSSBO(ssbo_collizes);
+        }
+        ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
+        ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
+        ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
+        if (ssbo_planets!=0) {
+            updateSSBOData<Molecule>(ssbo_planets, molecs);
+            updateSSBOData<double>(ssbo_r_cache, r_cache);
+        }
+        ssbo_planets_size = molecs.size();
+    } else {
+        updateSSBOData<Molecule>(ssbo_planets, molecs);
+        if (change_mass) {
+            updateSSBOData<double>(ssbo_r_cache, r_cache);
+        }
+    }
+
+}
+// вызывайте в main чтобы не делать длинных строк
+#define changePlanets_m(change_mass) changePlanets(ssbo_planets_size, ssbo_count_colz, ssbo_planets, ssbo_r_cache, ssbo_collizes, change_mass)
+char* inject_gpu_threads(const char* shader_source_code, const char* threads_count) {
+    if (!shader_source_code || !threads_count) return nullptr;
+
+    // Переводим в std::string исключительно внутри функции для безопасного поиска позиций
+    std::string source(shader_source_code);
+    std::string final_source = "";
+    
+    std::string version_token = "#version";
+    size_t version_pos = source.find(version_token);
+    
+    if (version_pos != std::string::npos) {
+        size_t end_of_line = source.find("\n", version_pos);
+        if (end_of_line != std::string::npos) {
+            final_source += source.substr(0, end_of_line + 1);
+            final_source += "#define GPU_THREADS ";
+            final_source += threads_count;
+            final_source += "\n";
+            final_source += source.substr(end_of_line + 1);
+        }
+    } else {
+        final_source = std::string("#define GPU_THREADS ") + threads_count + "\n" + source;
+    }
+
+    // Выделяем новую динамическую память под размер получившейся строки + 1 байт для нуль-терминатора '\0'
+    char* result_glsl = new char[final_source.length() + 1];
+    
+    // Копируем данные в выделенный буфер
+#if defined(_WIN32) && defined(_MSC_VER)
+    strcpy_s(result_glsl, final_source.length() + 1, final_source.c_str());
+#else
+    std::strcpy(result_glsl, final_source.c_str());
+#endif
+
+    return result_glsl; // Возвращаем сырой указатель char*
+}
 int main() {
     defaultFont.loadFromFile("C:/Windows/Fonts/arial.ttf");
+    setup_read(setup_path, settings);
+    gpu_mode = settings[gpu_mode_sett_id].get_value<bool>();
+    gravSourse = inject_gpu_threads(gravSourse, settings[gpu_num_threads_sett_id].value.c_str());
 
     std::vector<double> temperatures;
     std::vector<CircleData> circles(100);
@@ -1059,6 +1391,11 @@ int main() {
     for (int i = 0; i!=100; i++) {
         molecs[i] = random_molec;
     }
+    #ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    #else
+    int num_threads = 1;
+    #endif
     Vector2d pos_obj;
     bool hide_molecs = false;
     bool density_snow = false;
@@ -1088,10 +1425,56 @@ int main() {
     window.setFramerateLimit(30);
     sf::Clock clock;
     circle_lib_init();
+    if (gpu_mode) {
+        loadGPUFunctions();
+    }
     sf::VertexArray va_glows(sf::Triangles);
     sf::VertexArray va_circles(sf::Triangles);
+    std::vector<bool> vis_table;
+    std::vector<bool> destroyed(molecs.size());
     sf::Vector2i lastMousePos;
+    r_cache.resize(molecs.size());
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i!=molecs.size(); i++) {
+        r_cache[i] = molecs[i].get_r_real();
+    }
+    // gpu load
+    GLuint ssbo_planets;
+    size_t ssbo_planets_size;
+    GLuint ssbo_r_cache;
+    GLuint ssbo_collizes;
+    GLuint ssbo_count_colz;
+    GLuint gravShader;
+    if (gpu_mode) {
+        ssbo_planets = 0;
+        ssbo_planets_size = 0;
+        ssbo_r_cache = 0;
+        ssbo_collizes = 0;
+        ssbo_count_colz = createEmptySSBO(4);
+        {
+            std::vector<uint32_t> colz(1);
+            colz[0] = 0;
+            updateSSBOData(ssbo_count_colz, colz);
+        }
+        gravShader = compileShader(gravSourse);
+    }
     while (window.isOpen()) {
+        if (gpu_mode) {
+            // проверка (но лучше вызывайте changePlanets сами)
+            if (ssbo_planets_size!=molecs.size()) {
+                if (ssbo_planets!=0) {
+                    deleteSSBO(ssbo_planets);
+                    deleteSSBO(ssbo_r_cache);
+                    deleteSSBO(ssbo_collizes);
+                }
+                ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
+                ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
+                ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
+                updateSSBOData<Molecule>(ssbo_planets, molecs);
+                updateSSBOData<double>(ssbo_r_cache, r_cache);
+                ssbo_planets_size = molecs.size();
+            }
+        }
         sf::Event event;
         while (window.pollEvent(event)) {
             if (event.type == sf::Event::Closed) {
@@ -1201,6 +1584,12 @@ int main() {
                             for (int i = 0; i<len; i++) {
                                 molecs[i] = random_molec;
                             }
+                            r_cache.resize(molecs.size());
+                            #pragma omp parallel for schedule(static)
+                            for (int i = 0; i!=molecs.size(); i++) {
+                                r_cache[i] = molecs[i].get_r_real();
+                            }
+                            changePlanets_m(true);
                             camx = width/scale/2;
                             camy = width/scale/2;
                             double x_avg = 0;
@@ -1227,7 +1616,7 @@ int main() {
                                 for (size_t j = i + 1; j < molecs.size(); ++j) {
                                     double dx = molecs[j].x - molecs[i].x;
                                     double dy = molecs[j].y - molecs[i].y;
-                                    double dist = sqrt(dx*dx + dy*dy + 100.0); // Тот же softening, что в симуляции
+                                    double dist = sqrt(dx*dx + dy*dy);
 
                                     // Формула: Ep = -G * (m1 * m2) / r
                                     totalEp -= G * (molecs[i].size * molecs[j].size) / dist;
@@ -1263,11 +1652,10 @@ int main() {
                             speed += Vector2d(molecs[info_planet_index].sx, molecs[info_planet_index].sy);
                         }
                         molecs.emplace_back(pos_obj.x, pos_obj.y, obj_mass, speed.x, speed.y, false);
+                        r_cache.push_back(molecs[molecs.size()-1].get_r_real());
+                        changePlanets_m(true);
                         // std::cout << "speed2:" << magnitude(molecs[molecs.size()-1].sx, molecs[molecs.size()-1].sy) << "km/c\n";
                     }
-                } else if (event.key.code == sf::Keyboard::G) {
-                    info_mode = false;
-                    generateCosmos(molecs, 800/scale, 600/scale, window);
                 } else if (event.key.code == sf::Keyboard::Space) {
                     create_mode = false;
                     info_mode = false;
@@ -1342,7 +1730,12 @@ int main() {
                                 }
                                 fclose(f);
                                 std::cout << "load: " << size << " objects" << std::endl;
-
+                                r_cache.resize(molecs.size());
+                                #pragma omp parallel for schedule(static)
+                                for (int i = 0; i!=molecs.size(); i++) {
+                                    r_cache[i] = molecs[i].get_r_real();
+                                }
+                                changePlanets_m(true);
                             } else {
                                 std::cerr << "I don`t open file!" << std::endl;
                             }
@@ -1352,13 +1745,16 @@ int main() {
                     std::cout << molecs.size() << std::endl;
                     double x_avg = 0;
                     double y_avg = 0;
+                    double m_avg = 0;
                     for (const auto& molec: molecs) {
                         x_avg += molec.x;
                         y_avg += molec.y;
+                        m_avg += molec.size;
                     }
                     if (!molecs.empty()) {
-                        std::cout << x_avg/molecs.size() << std::endl;
-                        std::cout << y_avg/molecs.size() << std::endl;
+                        std::cout << "x:" << x_avg/molecs.size() << std::endl;
+                        std::cout << "y:" << y_avg/molecs.size() << std::endl;
+                        std::cout << "m:" << m_avg/molecs.size() << std::endl;
                     }
                     double totalEk = 0;
                     double totalEp = 0;
@@ -1426,6 +1822,9 @@ int main() {
                     }
                 } else if (event.key.code==sf::Keyboard::S) {
                     printStats(molecs);
+                } else if (event.key.code==sf::Keyboard::O) {
+                    show_setup_interface(settings, setup_path, defaultFont);
+                    window.setActive(true);
                 }
             }
         }
@@ -1441,44 +1840,45 @@ int main() {
             if (temperature_snow) {
                 temperatures.resize(molecs.size(), 0);
             }
-            #pragma omp parallel for num_threads(4) schedule(static)
-            for (int i = 0; i!=molecs.size(); i++) {
-                r_cache[i] = molecs[i].get_r_real();
-            }
-            #pragma omp parallel for num_threads(4) schedule(static)
-            for (auto& molec: molecs) {
-                Vector2d pos_start(molec.x, molec.y);
-                molec.forward();
-                Vector2d pos_end(molec.x, molec.y);
-                if (view_mode && &molecs[info_planet_index]==&molec) [[unlikely]] {
-                    Vector2d diff = pos_end-pos_start;
-                    camx += diff.x;
-                    camy += diff.y;
-                    pos_obj += diff;
-                }
-                if (!full_mode) {
-                    if (molec.x<0 || molec.x>width/scale) {
-                        molec.sx = -molec.sx;
-                        if (molec.x<0) {
-                            molec.x = 0;
-                        } else {
-                            molec.x = width/scale;
+            if (!gpu_mode) {
+                #pragma omp parallel for schedule(static)
+                for (auto& molec: molecs) {
+                    Vector2d pos_start(molec.x, molec.y);
+                    molec.forward();
+                    Vector2d pos_end(molec.x, molec.y);
+                    if (view_mode && &molecs[info_planet_index]==&molec) [[unlikely]] {
+                        Vector2d diff = pos_end-pos_start;
+                        camx += diff.x;
+                        camy += diff.y;
+                        pos_obj += diff;
+                    }
+                    if (!full_mode) {
+                        if (molec.x<0 || molec.x>width/scale) {
+                            molec.sx = -molec.sx;
+                            if (molec.x<0) {
+                                molec.x = 0;
+                            } else {
+                                molec.x = width/scale;
+                            }
+                        }
+                        if (molec.y<0 || molec.y>height/scale) {
+                            molec.sy = -molec.sy;
+                            if (molec.y<0) {
+                                molec.y = 0;
+                            } else {
+                                molec.y = height/scale;
+                            }
                         }
                     }
-                    if (molec.y<0 || molec.y>height/scale) {
-                        molec.sy = -molec.sy;
-                        if (molec.y<0) {
-                            molec.y = 0;
-                        } else {
-                            molec.y = height/scale;
-                        }
-                    }
+                    // molec.forward();
                 }
-                // molec.forward();
             }
             if (full_mode) {
-                std::vector<Molecule> need_create;
-                #pragma omp parallel for num_threads(4) schedule(static)
+                std::vector<std::vector<Molecule>> need_create;
+                std::vector<std::vector<double>> temperatures_need;
+                need_create.resize(num_threads);
+                temperatures_need.resize(num_threads);
+                #pragma omp parallel for schedule(static)
                 for (int i = 0; i < molecs.size(); ++i) { // Работаем через индекс для OpenMP
                     auto& molec = molecs[i];
                     if (molec.size<1e20) {
@@ -1494,13 +1894,14 @@ int main() {
                         double max_f = molec.getMaterialCohesionForce();
 
                         if (prilive_strenght > max_f) {
-                            double r_equil = sqrt((strength / 1e6 * molec.size) / (prilive_strenght / molec.get_r())); 
-                            double delta_R = std::max(0.0, molec.get_r() - r_equil);
+                            double radius = molec.get_r();
+                            double r_equil = sqrt((strength / 1e6 * molec.size) / (prilive_strenght / radius)); 
+                            double delta_R = std::max(0.0, radius - r_equil);
 
                             // 2. Считаем массу этого слоя (упрощенно как объем сферического слоя)
                             // dm = 4 * PI * R^2 * delta_R * плотность
-                            double density = molec.size / (1.333 * 3.1415 * pow(molec.get_r(), 3));
-                            double get_m = 4.0 * 3.1415 * pow(molec.get_r(), 2) * delta_R * density * dt * speed;
+                            double density = molec.size / (1.333 * 3.1415 * radius*radius*radius);
+                            double get_m = 4.0 * 3.1415 * radius*radius * delta_R * density * dt * speed;
 
                             // 3. Ограничиваем, чтобы за один шаг не оторвать больше половины (защита интегратора)
                             get_m = std::min(get_m, molec.size * 0.5);
@@ -1509,38 +1910,56 @@ int main() {
                                 double dx = molec.x - molec2.x;
                                 double dy = molec.y - molec2.y;
                                 double dist = sqrt(dx*dx + dy*dy);
-                                double ux = dx / dist; // Вектор направления
-                                double uy = dy / dist;
+                                double dist_inv = 1/dist;
+                                double ux = dx * dist_inv; // Вектор направления
+                                double uy = dy * dist_inv;
 
                                 // Разделяем общую массу отрыва на несколько мелких кусков
-                                int num = 5; 
+                                int num = 5;
                                 double fragment_m = get_m / num;
-
-                                m.lock();
+                                #ifdef _OPENMP
+                                int thread_id = omp_get_thread_num();
+                                #else
+                                int thread_id = 0;
+                                #endif
+                                Molecule new_molec = molec;
+                                new_molec.size = fragment_m;
                                 for (int f = 0; f < num; ++f) {
-                                    Molecule new_molec = molec;
-                                    new_molec.size = fragment_m;
-                                    
                                     // 1. Позиция: выносим цепочкой вдоль приливной оси
-                                    double side = (rand() % 2 == 0) ? 1.0 : -1.0; 
+                                    double side = ((rand() & 1) == 0) ? 1.0 : -1.0; 
                                     // Разносим их так, чтобы они не касались друг друга и мамы
                                     double spawn_dist = molec.get_r() + new_molec.get_r() * (2.0 + f * 1.2); 
                                     new_molec.x = molec.x + ux * spawn_dist * side;
                                     new_molec.y = molec.y + uy * spawn_dist * side;
 
                                     molec.size -= fragment_m;
-                                    need_create.push_back(new_molec);
+                                    r_cache[i] = molec.get_r_real();
+                                    need_create[thread_id].push_back(new_molec);
                                     if (temperature_snow) {
-                                        temperatures.push_back(temperatures[j-1]);
+                                        temperatures_need[thread_id].push_back(temperatures[j-1]);
                                     }
                                 }
-                                m.unlock();
                             }
                         }
                     }
                 }
-                for (auto& molec: need_create) {
-                    molecs.push_back(molec);
+                size_t added = 0;
+                for (size_t i = 0; i!=num_threads; i++) {
+                    added += need_create[i].size();
+                }
+                molecs.reserve(molecs.size()+added);
+                if (temperature_snow) {
+                    temperatures.reserve(temperatures.size()+added);
+                }
+                for (auto& vec: need_create) {
+                    for (auto& molec: vec) {
+                        molecs.push_back(molec);
+                    }
+                }
+                for (auto& vec: temperatures_need) {
+                    for (auto t: vec) {
+                        temperatures.push_back(t);
+                    }
                 }
                 int past_size = r_cache.size();
                 r_cache.resize(molecs.size());
@@ -1548,27 +1967,93 @@ int main() {
                     r_cache[i] = molecs[i].get_r_real();
                 }
             }
-            std::vector<std::pair<Molecule*, Molecule*>> is_collizes;
-            #pragma omp parallel for num_threads(4) schedule(static)
-            for (auto& molec: molecs) {
-                auto info = molec.gravity_start();
-                for (auto& molec2: molecs) {
-                    if (&molec != &molec2) {
-                        bool is_collize = molec.attract(molec2);
-                        if (is_collize) {
-                            m.lock();
-                            is_collizes.emplace_back(&molec, &molec2);
-                            m.unlock();
+            if (gpu_mode) {
+                if (ssbo_planets_size!=molecs.size()) {
+                    if (ssbo_planets!=0) {
+                        deleteSSBO(ssbo_planets);
+                        deleteSSBO(ssbo_r_cache);
+                        deleteSSBO(ssbo_collizes);
+                    }
+                    ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
+                    ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
+                    ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
+                    updateSSBOData<Molecule>(ssbo_planets, molecs);
+                    updateSSBOData<double>(ssbo_r_cache, r_cache);
+                    ssbo_planets_size = molecs.size();
+                }
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> is_collizes;
+            if (!gpu_mode) {
+                std::vector<std::vector<std::pair<Molecule*, Molecule*>>> is_collizes_paral;
+                is_collizes_paral.resize(num_threads);
+                #pragma omp parallel for schedule(static)
+                for (auto& molec: molecs) {
+                    auto info = molec.gravity_start();
+                    for (auto& molec2: molecs) {
+                        if (&molec != &molec2) {
+                            bool is_collize = molec.attract(molec2);
+                            if (is_collize) {
+                                // m.lock();
+                                #ifdef _OPENMP
+                                int thread_id = omp_get_thread_num();
+                                #else
+                                int thread_id = 0;
+                                #endif
+                                is_collizes_paral[thread_id].emplace_back(&molec, &molec2);
+                                // m.unlock();
+                            }
                         }
                     }
+                    molec.gravity_end(info);
                 }
-                molec.gravity_end(info);
+                for (auto& is_collizes2: is_collizes_paral) {
+                    for (size_t i = 0; i!=is_collizes2.size(); i++) {
+                        auto& [colz1, colz2] = is_collizes2[i];
+                        is_collizes.emplace_back(colz1-&molecs[0], colz2-&molecs[0]);
+                    }
+                }
             }
-            std::vector<bool> destroyed(molecs.size(), false);
+            if (!molecs.empty() && gpu_mode) {
+                bindSSBO(ssbo_planets, 0);
+                bindSSBO(ssbo_r_cache, 1);
+                bindSSBO(ssbo_collizes, 2);
+                bindSSBO(ssbo_count_colz, 3);
+                gpuRunnb(gravShader, molecs.size(), "total", (uint32_t)molecs.size(), "dt", dt*speed);
+                clearBind(0);
+                clearBind(1);
+                clearBind(2);
+                clearBind(3);
+                downloadSSBOData(ssbo_planets, molecs);
+                std::vector<uint32_t> colz(1);
+                downloadSSBOData(ssbo_count_colz, colz);
+                if (colz[0]>molecs.size()*6) {
+                    // std::cout << "The application has overwritten something's memory by " << (colz[0]-molecs.size()*2)*4*2 << " byte" << std":endl;
+                    // std::cout << ""
+                    std::cout << "error: too many collisions. buffer at " << molecs.size()*2 << " collisions but at the moment at " << colz[0] << " collisions" << std::endl;
+                    std::cout << "if you want to continue, press n and press Enter and hold it for " << colz[0]/(molecs.size()*2)/30 << " seconds at 30 fps, otherwise press y and then Enter" << std::endl;
+                    std::string str;
+                    std::cin >> str;
+                    if (str=="n") {
+                        exit(1);
+                    }
+                }
+                std::vector<uint32_t> last_colz = colz;
+                is_collizes.resize(colz[0]);
+                downloadSSBOData(ssbo_collizes, is_collizes);
+                colz[0] = 0;
+                updateSSBOData(ssbo_count_colz, colz);
+            }
+            destroyed.resize(molecs.size());
+            for (size_t i = 0; i!=molecs.size(); i++) {
+                destroyed[i] = false;
+            }
             std::vector<Molecule> need_molecs;
-            for (auto& [colz1, colz2] : is_collizes) {
-                int idx1 = colz1 - &molecs[0];
-                int idx2 = colz2 - &molecs[0];
+            //std::cout << "start " << last_colz[0] << " " << molecs.size() << std::endl;
+            // for (auto& is_collizes2 : is_collizes) {
+                //for (auto& [colz1, colz2] : is_collizes2) {
+            for (auto [idx1, idx2] : is_collizes) {
+                auto colz1 = &molecs[idx1];
+                auto colz2 = &molecs[idx2];
                 if (idx2>=destroyed.size() || idx1>=destroyed.size() || destroyed[idx1] || destroyed[idx2]) continue;
                 double dx = colz1->sx-colz2->sx;
                 double dy = colz1->sy-colz2->sy;
@@ -1590,6 +2075,7 @@ int main() {
                         temperatures[idx2] += 500000*uSq*colz1->size*colz2->size/colz2->getSpecificHeat()/totalM/totalM;
                     }
                     colz2->size = totalM;
+                    r_cache[idx2] = colz2->get_r_real();
 
                     destroyed[idx1] = true;
                     if (destroy_mode && two_space<u) {
@@ -1652,6 +2138,7 @@ int main() {
                         temperatures[idx1] += 500000*uSq*colz1->size*colz2->size/colz1->getSpecificHeat()/totalM/totalM;
                     }
                     colz1->size = totalM;
+                    r_cache[idx1] = colz1->get_r_real();
                     destroyed[idx2] = true;
                     if (destroy_mode && two_space<u) {
                         double k_minus_mass = 0.5*(1-std::pow(M_E, -(u/two_space-1)));
@@ -1699,6 +2186,7 @@ int main() {
                     }
                 }
             }
+            //}
 
             for (int i = molecs.size() - 1; i >= 0; i--) {
                 if (destroyed[i]) {
@@ -1719,8 +2207,9 @@ int main() {
             for (const auto& molec: need_molecs) {
                 molecs.push_back(molec);
             }
+            changePlanets_m(true);
             if (temperature_snow) {
-                #pragma omp parallel for num_threads(4) schedule(static)
+                #pragma omp parallel for schedule(static)
                 for (int i = 0; i!=temperatures.size(); i++) {
                     Molecule& planet = molecs[i];
                     double delta = 0;
@@ -1760,24 +2249,38 @@ int main() {
         }
         window.clear(sf::Color::White);
         if (!hide_molecs) {
-            circles.resize(molecs.size());
             size_t count_circle = 0;
             size_t count_glows = 0;
             size_t atmosfere_count = 0;
+            vis_table.resize(molecs.size());
             if (planets_mode) {
-                for (const auto& molec: molecs) {
+                // for (const auto& molec: molecs) {
+                for (size_t i = 0; i!=molecs.size(); i++) {
+                    const auto& molec = molecs[i];
                     double visualRadius = molec.get_r();
-                    if (get_object_params(molec.size).glow_factor!=0.0 && visualRadius*scale>=2) {
-                        atmosfere_count++;
+                    CircleData circle(std::max(visualRadius * scale, 2.0)*1.5);
+                    circle.setPosition(to_coords(Vector2d(molec.x, molec.y), 0));
+                    bool vis = circle.in_cam(width, height);
+                    vis_table[i] = vis;
+                    if (vis) {
+                        count_circle++;
+                        if (settings[show_atmosphere_sett_id].get_value<bool>() && get_object_params(molec.size).glow_factor!=0.0 && visualRadius*scale>=2) {
+                            atmosfere_count++;
+                        }
                     }
                 }
             }
+            circles.resize(count_circle);
             va_glows.resize(atmosfere_count*90);
-            for (auto molec: molecs) {
-                if (molec.draw(circles, va_glows, count_glows, count_circle)) {
-                    count_glows++;
+            count_circle = 0;
+            for (size_t i = 0; i!=molecs.size(); i++) {
+                const auto& molec = molecs[i];
+                if (vis_table[i]) {
+                    if (molec.draw(circles, va_glows, count_glows, count_circle)) {
+                        count_glows++;
+                    }
+                    count_circle++;
                 }
-                count_circle++;
 
             }
             //std::cout << atmosfere_count << " " << count_glows << std::endl;
@@ -1787,8 +2290,9 @@ int main() {
         }
         if (create_mode) {
             double size = Molecule(0,0, obj_mass, 0,0, false).get_r();
-            sf::CircleShape shape(size*scale<2 ? 2: size*scale);
-            shape.setPosition(to_coords(pos_obj, size));
+            double size_screen = size*scale<2 ? 2: size*scale;
+            sf::CircleShape shape(size_screen);
+            shape.setPosition(to_coords(pos_obj, size_screen));
             if (planets_mode) {
                 sf::Color color = get_object_params(obj_mass).core_color;
                shape.setFillColor(color);
@@ -1806,73 +2310,41 @@ int main() {
             // std::cout << "speed1:" << magn(simVel) << "km/c\n";
             Vector2d simPos = pos_obj; 
             const int steps = 1000;
-            float prediction_dt = (full_mode? 500.0f: 0.01f);
+            const double prediction_dt = (full_mode? 500.0f: 0.01f);
+            const double prediction_dtSq = prediction_dt*prediction_dt;
             
             sf::VertexArray trajectory(sf::PrimitiveType::LineStrip, steps);
             
-            auto backup_molecs = molecs; 
-
+            auto simulate_molecs = molecs; 
+            size_t sim_molec_idx = simulate_molecs.size();
+            simulate_molecs.emplace_back(simPos.x, simPos.y, obj_mass, simVel.x, simVel.y, false);
             for (int i = 0; i < steps; ++i) {
-                for (size_t a = 0; a < molecs.size(); ++a) {
-                    for (size_t b = a + 1; b < molecs.size(); ++b) {
-                        double dx = molecs[b].x - molecs[a].x;
-                        double dy = molecs[b].y - molecs[a].y;
-                        double distSq = dx*dx + dy*dy;
-                        
-                        double common_f = (strength / 1000000000.0) / distSq;
-                        double dist = sqrt(distSq);
-
-                        double force_to_A = common_f * molecs[b].size;
-                        double force_to_B = common_f * molecs[a].size;
-
-                        molecs[a].sx += (force_to_A * dx / dist) * prediction_dt;
-                        molecs[a].sy += (force_to_A * dy / dist) * prediction_dt;
-
-                        molecs[b].sx -= (force_to_B * dx / dist) * prediction_dt;
-                        molecs[b].sy -= (force_to_B * dy / dist) * prediction_dt;
+                #pragma omp parallel for
+                for (size_t a = 0; a < simulate_molecs.size(); ++a) {
+                    auto d = simulate_molecs[a].gravity_start();
+                    for (size_t b = 0; b < simulate_molecs.size(); ++b) {
+                        if (a!=b) {
+                            simulate_molecs[a].attract_opt(simulate_molecs[b]);
+                        }
                     }
+                    simulate_molecs[a].gravity_end(d, prediction_dt);
                 }
-                #pragma paralel for num_threads(4)
-                for (auto& m : molecs) {
-                    double dx = m.x - simPos.x;
-                    double dy = m.y - simPos.y;
-                    double distSq = dx*dx + dy*dy;
-                    
-                    double common_f = (strength / 1000000000.0) / distSq;
-                    double dist = sqrt(distSq);
-
-                    // Молекула тянет simPos
-                    double force_on_sim = common_f * m.size;
-                    simVel.x += (force_on_sim * dx / dist) * prediction_dt;
-                    simVel.y += (force_on_sim * dy / dist) * prediction_dt;
-
-                    // simPos тянет молекулу (используем obj_mass)
-                    double force_on_m = common_f * obj_mass;
-                    m.sx -= (force_on_m * dx / dist) * prediction_dt;
-                    m.sy -= (force_on_m * dy / dist) * prediction_dt;
-                }
-
-                simPos.x += simVel.x * prediction_dt;
-                simPos.y += simVel.y * prediction_dt;
-
-                for (auto& m : molecs) {
-                    m.x += m.sx * prediction_dt;
-                    m.y += m.sy * prediction_dt;
+                #pragma omp parallel for
+                for (auto& m : simulate_molecs) {
+                    m.forward(prediction_dt, prediction_dtSq);
                 }
                 if (view_mode) {
-                    Vector2d old_pos(backup_molecs[info_planet_index].x, backup_molecs[info_planet_index].y);
-                    Vector2d new_pos(molecs[info_planet_index].x, molecs[info_planet_index].y);
-                    trajectory[i].position = to_coords(simPos+old_pos-new_pos, 0);
+                    Vector2d old_pos(molecs[info_planet_index].x, molecs[info_planet_index].y);
+                    Vector2d new_pos(simulate_molecs[info_planet_index].x, simulate_molecs[info_planet_index].y);
+                    trajectory[i].position = to_coords(Vector2d(simulate_molecs[sim_molec_idx].x, simulate_molecs[sim_molec_idx].y)+old_pos-new_pos, 0);
                 } else {
-                    trajectory[i].position = to_coords(simPos, 0);
+                    trajectory[i].position = to_coords(Vector2d(simulate_molecs[sim_molec_idx].x, simulate_molecs[sim_molec_idx].y), 0);
                 }
                 
                 sf::Color tColor = sf::Color::Black;
                 tColor.a = static_cast<sf::Uint8>(255 * (1.0f - (float)i / steps));
                 trajectory[i].color = tColor;
             }
-
-            molecs = backup_molecs;
             window.draw(trajectory);
 
             sf::VertexArray line(sf::Lines, 2);
@@ -2020,7 +2492,7 @@ int main() {
             if (sf::Mouse::isButtonPressed(sf::Mouse::Left)) {
                 Vector2d pos = from_coords(window.mapPixelToCoords(sf::Mouse::getPosition(window)), 0);
                 bool destroys[molecs.size()];
-                #pragma omp paralel for num_threads(4) schedule(static)
+                #pragma omp parallel for schedule(static)
                 for (int i = 0; i!=molecs.size(); i++) {
                     const auto& molec = molecs[i];
                     if (magn(Vector2d(molec.x, molec.y)-pos)<=remove_size) {
