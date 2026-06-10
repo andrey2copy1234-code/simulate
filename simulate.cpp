@@ -17,6 +17,7 @@
 #endif
 #include "gpu_loader.cpp" // загружает gpu функции и имеет свои функции
 #include "settings_lib.cpp" // для настроек
+#include "bloom_test.cpp"
 bool gpu_mode = false;
 // если что-то добавляется - добавлять в конец
 // не меняйте порядок
@@ -59,12 +60,54 @@ std::vector<Setting> settings = {
         16,                    // Разрядность: 16 бит. При записи в файл превратится ровно в 4 HEX-символа (256 -> '0100')
         0, 0,                  // Диапазон min/max игнорируется, так как ниже передан жесткий список options
         {"8", "16", "32", "64", "128", "256", "512", "1024"} // Ограничение выбора: ползунок прыгает строго по этим числам
+    },
+    {
+        "Свечение от звёзд в 3d режиме",
+        "Включает или выключает эфект свечения звёзд в режиме 3d",
+        SettingType::Bool,
+        InputType::YesNo,
+        "true",
+        "true",
+        false,   // Применяется мгновенно, перезапуск не нужен
+        false,
+        32,
+        0, 0,
+        {}
+    },
+    {
+        "Простое свечение звёзд в 3d режиме", 
+        "Включает (нет) или выключает (да) сильное свечение звёзд",
+        SettingType::Bool,
+        InputType::YesNo,
+        "false",
+        "false",
+        false,   // Применяется мгновенно, перезапуск не нужен
+        false,
+        32,
+        0, 0,
+        {}
+    },
+    {
+        "Простые тени планет в 3d режиме", 
+        "Включает или выключает тени планет в режиме 3d",
+        SettingType::Bool,
+        InputType::YesNo,
+        "true",
+        "true",
+        false,   // Применяется мгновенно, перезапуск не нужен
+        false,
+        32,
+        0, 0,
+        {}
     }
 };
 const std::string setup_path = "settings.save";
 #define gpu_mode_sett_id 0
 #define show_atmosphere_sett_id 1
 #define gpu_num_threads_sett_id 2
+#define bloom_sett_id 3
+#define simple_bloom_stars_sett_id 4
+#define simple_shadows_sett_id 5
 // #include "gpu_loader.cpp"
 //in_simulate_imports:
 // #include <SFML/Graphics.hpp>
@@ -75,6 +118,256 @@ const std::string setup_path = "settings.save";
 // #include <iostream>
 // #include <mutex>
 using Vector2d = sf::Vector2<double>;
+using Vector3d = sf::Vector3<double>;
+// 3d штуки
+struct CameraDirections {
+    Vector3d forward;
+    Vector3d right;
+};
+
+CameraDirections calculateCameraDirections(const Vector3d& cam_rotate) {
+    CameraDirections dirs;
+    
+    const double DEG_TO_RAD = 3.14159265358979323846 / 180.0;
+    double yawRad   = cam_rotate.x * DEG_TO_RAD;
+    double pitchRad = cam_rotate.y * DEG_TO_RAD;
+
+    double cosYaw   = std::cos(yawRad);
+    double sinYaw   = std::sin(yawRad);
+    double cosPitch = std::cos(pitchRad);
+    double sinPitch = std::sin(pitchRad);
+
+    // 1. Истинный вектор Forward для правой системы координат (OpenGL/SFML)
+    // При нулевых углах камера смотрит строго вдоль оси -Z
+    dirs.forward.x = sinYaw * cosPitch;
+    dirs.forward.y = sinPitch;
+    dirs.forward.z = -cosYaw * cosPitch; 
+    
+    // 2. Истинный вектор Right (Вправо) через честное произведение Forward x (0, 1, 0)
+    dirs.right.x = cosYaw;
+    dirs.right.y = 0.0;
+    dirs.right.z = sinYaw;
+    return dirs;
+}
+void updateCameraPosition(Vector3d& cam_pos, const CameraDirections& dirs, float speed, float deltaTime) {
+    // Вычисляем дистанцию, которую камера должна пройти за этот кадр
+    float moveSpeed = speed * deltaTime;
+
+    // Движение Вперед / Назад (W / S)
+    if (sf::Keyboard::isKeyPressed(sf::Keyboard::W)) {
+        cam_pos.x += dirs.forward.x * moveSpeed;
+        cam_pos.y += dirs.forward.y * moveSpeed; 
+        cam_pos.z += dirs.forward.z * moveSpeed;
+    }
+    if (sf::Keyboard::isKeyPressed(sf::Keyboard::S)) {
+        cam_pos.x -= dirs.forward.x * moveSpeed;
+        cam_pos.y -= dirs.forward.y * moveSpeed;
+        cam_pos.z -= dirs.forward.z * moveSpeed;
+    }
+
+    // Движение Влево / Вправо (A / D)
+    if (sf::Keyboard::isKeyPressed(sf::Keyboard::A)) {
+        cam_pos.x += dirs.right.x * moveSpeed;
+        cam_pos.y += dirs.right.y * moveSpeed;
+        cam_pos.z += dirs.right.z * moveSpeed;
+    }
+    if (sf::Keyboard::isKeyPressed(sf::Keyboard::D)) {
+        cam_pos.x -= dirs.right.x * moveSpeed;
+        cam_pos.y -= dirs.right.y * moveSpeed;
+        cam_pos.z -= dirs.right.z * moveSpeed;
+    }
+}
+void updateCameraRotation(Vector3d& cam_rotate, sf::RenderWindow& window, double sensitivity = 0.1) {
+    // 1. Находим центр вашего окна
+    sf::Vector2i windowCenter(window.getSize().x / 2, window.getSize().y / 2);
+
+    // 2. Получаем текущую позицию мыши относительно окна
+    sf::Vector2i mousePos = sf::Mouse::getPosition(window);
+
+    // 3. Считаем, на сколько пикселей сдвинулась мышь от центра
+    double deltaX = -static_cast<double>(mousePos.x - windowCenter.x);
+    double deltaY = -static_cast<double>(mousePos.y - windowCenter.y);
+
+    // 4. Изменяем углы поворота (умножаем на чувствительность)
+    cam_rotate.x += deltaX * sensitivity; // Yaw (влево / вправо)
+    cam_rotate.y -= deltaY * sensitivity; // Pitch (вверх / вниз) — тут минус, чтобы инвертировать ось
+
+    // 5. Ограничиваем вертикальный наклон (Pitch), чтобы нельзя было сделать сальто головой
+    // Камера жестко остановится, если посмотреть строго вертикально вверх (90) или вниз (-90)
+    if (cam_rotate.y > 89.0)  cam_rotate.y = 89.0;
+    if (cam_rotate.y < -89.0) cam_rotate.y = -89.0;
+
+    // 6. ВСЕГДА возвращаем мышь обратно в центр окна, фиксируя её для следующего кадра
+    sf::Mouse::setPosition(windowCenter, window);
+}
+Vector3d rotateVector3D(const Vector3d& vec, const Vector3d& rotate) {
+    Vector3d result = vec;
+
+    // Переводим углы из градусов в радианы
+    const double DEG_TO_RAD = 3.14159265358979323846 / 180.0;
+    double yawRad   = rotate.x * DEG_TO_RAD;
+    double pitchRad = rotate.y * DEG_TO_RAD;
+
+    // Считаем тригонометрию
+    double cy = std::cos(yawRad);   double sy = std::sin(yawRad);
+    double cp = std::cos(pitchRad);  double sp = std::sin(pitchRad);
+
+    // 1. Поворот вокруг оси Y (Yaw / Влево-Вправо)
+    double x1 = result.x * cy - result.z * sy;
+    double z1 = result.x * sy + result.z * cy;
+    double y1 = result.y; // При вращении вокруг Y координата Y не меняется
+
+    // 2. Поворот вокруг оси X (Pitch / Вверх-Вниз)
+    // Используем промежуточный результат (x1, y1, z1)
+    result.x = x1; // При вращении вокруг X координата X не меняется
+    result.y = y1 * cp - z1 * sp;
+    result.z = y1 * sp + z1 * cp;
+
+    return result;
+}
+struct CameraVectors {
+    sf::Vector3f forward;
+    sf::Vector3f right;
+    sf::Vector3f up;
+};
+
+CameraVectors calculateCameraVectors(Vector3d cam_rotate) {
+    const float PI = 3.1415926535f;
+
+    // Переводим углы в радианы
+    float yaw   = cam_rotate.x * (PI / 180.0f);
+    float pitch = cam_rotate.y * (PI / 180.0f);
+    float roll  = cam_rotate.z * (PI / 180.0f);
+
+    float cosPitch = std::cos(pitch);
+    float sinPitch = std::sin(pitch);
+    float cosYaw   = std::cos(yaw);
+    float sinYaw   = std::sin(yaw);
+
+    // 1. Истинный вектор Forward (Правая система координат, взгляд на -Z при нуле)
+    sf::Vector3f forward;
+    forward.x = sinYaw * cosPitch;
+    forward.y = sinPitch;
+    forward.z = -cosYaw * cosPitch;
+
+    // Вспомогательный вектор "Верх мира"
+    sf::Vector3f worldUp(0.0f, 1.0f, 0.0f);
+
+    // Лямбда для нормализации
+    auto normalize = [](sf::Vector3f v) {
+        float length = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        return (length > 0.0f) ? sf::Vector3f(v.x / length, v.y / length, v.z / length) : v;
+    };
+
+    forward = normalize(forward);
+
+    // 2. Строим вектор Right через Cross(Forward, WorldUp)
+    // Чтобы при нулевых углах Right смотрел строго в +X
+    sf::Vector3f right;
+    right.x = forward.z * worldUp.z - forward.z * worldUp.y; // Упрощается
+    // Расписываем честное векторное произведение:
+    right.x = forward.z * worldUp.y - forward.y * worldUp.z;
+    right.y = forward.x * worldUp.z - forward.z * worldUp.x;
+    right.z = forward.y * worldUp.x - forward.x * worldUp.y;
+    right = normalize(right);
+
+    // Корректируем, если смотрим строго вертикально вверх/вниз (deadlock)
+    if (std::abs(cosPitch) < 0.0001f) {
+        right = sf::Vector3f(cosYaw, 0.0f, sinYaw);
+    }
+
+    // 3. Строим истинный вектор Up через Cross(Right, Forward)
+    // Он всегда будет строго перпендикулярен направлению взгляда
+    sf::Vector3f up;
+    up.x = right.y * forward.z - right.z * forward.y;
+    up.y = right.z * forward.x - right.x * forward.z;
+    up.z = right.x * forward.y - right.y * forward.x;
+    up = normalize(up);
+
+    // 4. Если есть вращение по Z (Roll) — аккуратно поворачиваем оси Right и Up
+    if (std::abs(roll) > 0.0001f) {
+        float cosRoll = std::cos(roll);
+        float sinRoll = std::sin(roll);
+        
+        sf::Vector3f oldRight = right;
+        sf::Vector3f oldUp = up;
+
+        right = oldRight * cosRoll + oldUp * sinRoll;
+        up = -oldRight * sinRoll + oldUp * cosRoll;
+    }
+
+    return { forward, right, up };
+}
+
+struct ProjectedCircle {
+    // 1. Блок double (8 байт каждый) — ставим в самый верх для идеального выравнивания
+    double depth;        // Расстояние до камеры (8 байт) — нужно для сортировки
+
+    // 2. Блок sf::Vector2f (8 байт каждый, состоит из двух float)
+    sf::Vector2f pos;       // Позиция в мире XZ (8 байт)
+    sf::Vector2i screenPos; // Позиция на экране XY (8 байт)
+
+    // 3. Блок одиночных float (4 байта каждый)
+    float radius;       // Радиус в мировых километрах (4 байт)
+    float screenRadius;  // Радиус на экране в пикселях (4 байта)
+    float bloom_size;    // Светимость для Блума (4 байта)
+    float bloom_light;   // Вычисленный поток света (4 байта)
+    float alberto;
+
+    // 4. Мелкие типы (4 байта) — ставим в самый конец
+    sf::Color color;     // Цвет RGBA (4 байта: по 1 байту на канал)
+};
+float calcScale(float windowHeight, float fovDeg = 90.0f) {
+    const float PI = 3.1415926535f;
+    float fovRad = fovDeg * (PI / 180.0f);
+    return (windowHeight * 0.5f) / std::tan(fovRad * 0.5f);
+}
+double precomputeStarPower(double mass_kg) {
+    if (mass_kg <= 0.0) return 0.0;
+
+    const double SUN_MASS_KG = 1.989e30;
+    double mass_relative = mass_kg / SUN_MASS_KG;
+    return std::pow(mass_relative, 3.5);
+}
+// считает по физике
+float getStarBloomSize(float massInKg) {
+    // 1. Константы
+    float SUN_MASS = 1.989e30;       // Масса Солнца в кг
+    float SUN_TEMP = 5778.0;         // Температура Солнца в Кельвинах
+    float SIGMA = 5.67e-8;           // Постоянная Стефана-Больцмана
+    float EARTH_LUX = 75000.0;       // Базовая земная освещенность (наш 1.0)
+    float m = massInKg / SUN_MASS;
+    float starTemp = SUN_TEMP * pow(m, 0.505); 
+    starTemp = std::max(starTemp, 2000.0f);
+    float t2 = starTemp * starTemp;
+    float energyWatts = SIGMA * (t2 * t2);
+    float tNormalized = starTemp / 6000.0;
+    float lumensPerWatt = 95.0 * (tNormalized * tNormalized * (3.0 - 2.0 * tNormalized));
+    lumensPerWatt = std::max(lumensPerWatt, 5.0f);
+    float starLux = energyWatts * lumensPerWatt;
+    float starHdrBrightness = starLux / EARTH_LUX;
+    float bloomSource = std::max(starHdrBrightness - 1.0, 0.0);
+    float exposure = 0.005; 
+    float bloom_size = (1.0 - exp(-bloomSource * exposure)) * 2.0;
+    return bloom_size;
+}
+// считает не по физике
+float getSimpleStarBloom(float massInKg, float userSensitivity) {
+    const float SUN_MASS = 1.989e30f;
+    float relativeMass = massInKg / SUN_MASS;
+
+    // Ограничиваем влияние массы, чтобы тяжелые звезды не ломали экран
+    float baseGlow = relativeMass * 0.5f;
+    if (baseGlow < 0.2f) baseGlow = 0.2f;
+    if (baseGlow > 1.5f) baseGlow = 1.5f;
+
+    // Умножаем на 2.0, чтобы вписаться в рамки вашей шкалы [0.0 - 2.0]
+    float bloom_size = baseGlow * userSensitivity * 2.0f;
+
+    // Жестко гарантируем, что значение не превысит 2.0
+    return std::min(bloom_size, 2.0f);
+}
+// molec path
 double chaos = 410;
 std::mutex m;
 int width = 800;
@@ -120,12 +413,12 @@ Visuals get_object_params(double m) {
     // 3. ГАЗОВЫЕ ГИГАНТЫ
     if (m < 0.08 * M_SUN) {
         // тепло-оранжевый
-        return { sf::Color(255, 140, 50), sf::Color(255, 100, 0, 60), 1.2f };
+        return { sf::Color(255, 140, 50), sf::Color(255, 100, 10, 60), 1.2f };
     }
 
     // 4. ЗВЕЗДЫ (Классификация по массе)
     if (m < 0.8 * M_SUN) { // Красные/Оранжевые карлики
-        return { sf::Color(255, 60, 0), sf::Color(255, 30, 0, 100), 1.3f };
+        return { sf::Color(255, 60, 0), sf::Color(255, 30, 5, 100), 1.3f };
     }
     if (m < 1.2 * M_SUN) { // Желтые звезды (как Солнце)
         return { sf::Color(255, 255, 200), sf::Color(255, 255, 100, 0), 1.4f };
@@ -916,6 +1209,7 @@ L"# Режимы\n"
 "* - - увеличить кисть удаления\n"
 "* Shift-F - режим разрушения\n"
 "* o - открыть настройки\n"
+"* v - посмотреть в 3d\n"
 "# Управление (с full):\n"
 "* колёсико мыши - приближение/отдаление из точки куда указывает мышка\n"
 "* нажатие - выделить планету (тогда ещё можно будет проследить, изменить её массу)/сбросить выделение\n"
@@ -1316,25 +1610,32 @@ void main() {
 // синхронизирует данные с видиокартой
 // но r_cache обновляйте сами и до вызова этой функции
 // но если вы изменили только массу одного объекта или вы изменили позицию только одного объекта делайте сами
-void changePlanets(size_t& ssbo_planets_size, GLuint& ssbo_count_colz, GLuint& ssbo_planets, GLuint& ssbo_r_cache, GLuint& ssbo_collizes, bool change_mass) {
-    if (!gpu_mode) {
-        return;
-    }
+void changePlanets(size_t& ssbo_planets_size, GLuint& ssbo_count_colz, GLuint& ssbo_planets, GLuint& ssbo_r_cache, GLuint& ssbo_collizes, GLuint& ssbo_project_circles, bool change_mass, bool no_change_molecs=false) {
     if (ssbo_planets_size!=molecs.size()) {
         if (ssbo_planets!=0) {
-            deleteSSBO(ssbo_planets);
-            deleteSSBO(ssbo_r_cache);
-            deleteSSBO(ssbo_collizes);
+            if (gpu_mode) {
+                deleteSSBO(ssbo_planets);
+                deleteSSBO(ssbo_r_cache);
+                deleteSSBO(ssbo_collizes);
+            }
+            if (ssbo_project_circles!=0) {
+                deleteSSBO(ssbo_project_circles);
+            }
         }
-        ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
-        ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
-        ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
-        if (ssbo_planets!=0) {
+        if (gpu_mode) {
+            ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
+            ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
+            ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
+        }
+        if (ssbo_project_circles!=0) {
+            ssbo_project_circles = createEmptySSBO(sizeof(ProjectedCircle)*molecs.size());
+        }
+        if (ssbo_planets!=0 && gpu_mode) {
             updateSSBOData<Molecule>(ssbo_planets, molecs);
             updateSSBOData<double>(ssbo_r_cache, r_cache);
         }
         ssbo_planets_size = molecs.size();
-    } else {
+    } else if (!no_change_molecs && gpu_mode && ssbo_planets!=0) {
         updateSSBOData<Molecule>(ssbo_planets, molecs);
         if (change_mass) {
             updateSSBOData<double>(ssbo_r_cache, r_cache);
@@ -1343,7 +1644,7 @@ void changePlanets(size_t& ssbo_planets_size, GLuint& ssbo_count_colz, GLuint& s
 
 }
 // вызывайте в main чтобы не делать длинных строк
-#define changePlanets_m(change_mass) changePlanets(ssbo_planets_size, ssbo_count_colz, ssbo_planets, ssbo_r_cache, ssbo_collizes, change_mass)
+#define changePlanets_m(change_mass, change_molecs) changePlanets(ssbo_planets_size, ssbo_count_colz, ssbo_planets, ssbo_r_cache, ssbo_collizes, ssbo_project_circles, change_mass, !change_molecs)
 char* inject_gpu_threads(const char* shader_source_code, const char* threads_count) {
     if (!shader_source_code || !threads_count) return nullptr;
 
@@ -1418,6 +1719,15 @@ int main() {
     bool remove_mode = false;
     double remove_size = 100000;
 
+    bool mode_3d = false;
+    std::vector<ProjectedCircle> project_circles(molecs.size());
+
+    Vector3d cam_pos;
+    Vector3d cam_rotate;
+    const float start_speed = 2e6;
+    float speed_cam = start_speed; // 12 млн. км/с
+    float speed_pow_sec_cam = 1.2;
+
     int chunk = 5;
     sf::VideoMode vidioMode(800, 600);
     sf::View view(sf::FloatRect(0.f, 0.f, 800.f, 600.f));
@@ -1425,9 +1735,10 @@ int main() {
     window.setFramerateLimit(30);
     sf::Clock clock;
     circle_lib_init();
-    if (gpu_mode) {
-        loadGPUFunctions();
-    }
+    bloom_init();
+    //if (gpu_mode) {
+    loadGPUFunctions();
+    //}
     sf::VertexArray va_glows(sf::Triangles);
     sf::VertexArray va_circles(sf::Triangles);
     std::vector<bool> vis_table;
@@ -1439,6 +1750,7 @@ int main() {
         r_cache[i] = molecs[i].get_r_real();
     }
     // gpu load
+    // для вычислений на видиокарте
     GLuint ssbo_planets;
     size_t ssbo_planets_size;
     GLuint ssbo_r_cache;
@@ -1458,22 +1770,18 @@ int main() {
         }
         gravShader = compileShader(gravSourse);
     }
+    // для 3d
+    sf::Shader display3d_shader; // считает в 3d тени, куда попал луч (матиматически), заготавливает сверх-яркие пиксели (яркость больше 1.0 тоесть 256+)
+    if (!display3d_shader.loadFromFile("3d_planets.frag", sf::Shader::Fragment)) {
+        std::cout << "error in shader or don't found file 3d_planets.frag" << std::endl;
+        exit(-1);
+    }
+    GLuint ssbo_project_circles = 0;
+    sf::RenderTexture tex3d_display;
     while (window.isOpen()) {
         if (gpu_mode) {
             // проверка (но лучше вызывайте changePlanets сами)
-            if (ssbo_planets_size!=molecs.size()) {
-                if (ssbo_planets!=0) {
-                    deleteSSBO(ssbo_planets);
-                    deleteSSBO(ssbo_r_cache);
-                    deleteSSBO(ssbo_collizes);
-                }
-                ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
-                ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
-                ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
-                updateSSBOData<Molecule>(ssbo_planets, molecs);
-                updateSSBOData<double>(ssbo_r_cache, r_cache);
-                ssbo_planets_size = molecs.size();
-            }
+            changePlanets_m(false, false);
         }
         sf::Event event;
         while (window.pollEvent(event)) {
@@ -1483,6 +1791,12 @@ int main() {
                 sf::FloatRect visibleArea(0.f, 0.f, event.size.width, event.size.height);
                 width = event.size.width;
                 height = event.size.height;
+                if (mode_3d) {
+                    tex3d_display.create(width, height);
+                    if (settings[bloom_sett_id].get_value<bool>()) {
+                        convertToHDRTexture(const_cast<sf::Texture&>(tex3d_display.getTexture()), width, height);
+                    }
+                }
                 window.setView(sf::View(visibleArea));
                 clock.restart();
             } else if (event.type == sf::Event::MouseButtonPressed && !remove_mode) {
@@ -1589,7 +1903,10 @@ int main() {
                             for (int i = 0; i!=molecs.size(); i++) {
                                 r_cache[i] = molecs[i].get_r_real();
                             }
-                            changePlanets_m(true);
+                            changePlanets_m(true, true);
+                            if (mode_3d) {
+                                sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                            }
                             camx = width/scale/2;
                             camy = width/scale/2;
                             double x_avg = 0;
@@ -1631,11 +1948,17 @@ int main() {
                 } else if (event.key.code == sf::Keyboard::H) {
                     if (event.key.control) {
                         showHelp();
+                        clock.restart();
+                        if (mode_3d) {
+                            sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                        }
                     } else {
                         hide_molecs = !hide_molecs;
                     }
                 } else if (event.key.code == sf::Keyboard::D) {
-                    density_snow = !density_snow;
+                    if (!mode_3d) {
+                        density_snow = !density_snow;
+                    }
                 } else if (event.key.code == sf::Keyboard::P) {
                     planets_mode = !planets_mode;
                     if (!planets_mode) {
@@ -1653,7 +1976,7 @@ int main() {
                         }
                         molecs.emplace_back(pos_obj.x, pos_obj.y, obj_mass, speed.x, speed.y, false);
                         r_cache.push_back(molecs[molecs.size()-1].get_r_real());
-                        changePlanets_m(true);
+                        changePlanets_m(true, true);
                         // std::cout << "speed2:" << magnitude(molecs[molecs.size()-1].sx, molecs[molecs.size()-1].sy) << "km/c\n";
                     }
                 } else if (event.key.code == sf::Keyboard::Space) {
@@ -1672,6 +1995,9 @@ int main() {
                         obj_mass = mass;
                     }
                     clock.restart();
+                    if (mode_3d) {
+                        sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                    }
                 } else if (event.key.code == sf::Keyboard::T) {
                     temperature_snow = !temperature_snow;
                 } else if (event.key.code == sf::Keyboard::F) {
@@ -1692,6 +2018,9 @@ int main() {
                             cfps = fps;
                         }
                         clock.restart();
+                        if (mode_3d) {
+                            sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                        }
                     }
                 } else if (event.key.control) {
                     if (event.key.code == sf::Keyboard::S) {
@@ -1735,7 +2064,8 @@ int main() {
                                 for (int i = 0; i!=molecs.size(); i++) {
                                     r_cache[i] = molecs[i].get_r_real();
                                 }
-                                changePlanets_m(true);
+                                changePlanets_m(true, true);
+                                clock.restart();
                             } else {
                                 std::cerr << "I don`t open file!" << std::endl;
                             }
@@ -1815,16 +2145,40 @@ int main() {
                         }
                     }
                 } else if (event.key.code == sf::Keyboard::A) {
-                    if (event.key.shift) {
-                        chaos /= 1.2;
-                    } else {
-                        chaos *= 1.2;
+                    if (!mode_3d) {
+                        if (event.key.shift) {
+                            chaos /= 1.2;
+                        } else {
+                            chaos *= 1.2;
+                        }
                     }
                 } else if (event.key.code==sf::Keyboard::S) {
-                    printStats(molecs);
+                    if (!mode_3d) {
+                        printStats(molecs);
+                    }
                 } else if (event.key.code==sf::Keyboard::O) {
                     show_setup_interface(settings, setup_path, defaultFont);
                     window.setActive(true);
+                    if (mode_3d) {
+                        sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                    }
+                    clock.restart();
+                } else if (event.key.code==sf::Keyboard::V) {
+                    mode_3d = !mode_3d;
+                    window.setMouseCursorVisible(!mode_3d);
+                    if (mode_3d) {
+                        sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
+                        ssbo_project_circles = createEmptySSBO(sizeof(ProjectedCircle)*molecs.size());
+                        tex3d_display.create(width, height);
+                        if (settings[bloom_sett_id].get_value<bool>()) {
+                            convertToHDRTexture(const_cast<sf::Texture&>(tex3d_display.getTexture()), width, height);
+                        }
+                        cam_pos = Vector3d(camx, 0, camy);
+                    } else if (ssbo_project_circles!=0) {
+                        deleteSSBO(ssbo_project_circles);
+                        ssbo_project_circles = 0;
+                        tex3d_display.create(1, 1);
+                    }
                 }
             }
         }
@@ -1832,6 +2186,19 @@ int main() {
         dt = delta.asSeconds();
         if (was_rebooted_n_seconds_ago(dt+1)) [[unlikely]] {
             continue;
+        }
+        if (mode_3d) {
+            CameraDirections dirs = calculateCameraDirections(cam_rotate);
+            Vector3d last_cam_pos = cam_pos;
+            updateCameraPosition(cam_pos, dirs, speed_cam, dt);
+            if (last_cam_pos==cam_pos) {
+                speed_cam = start_speed;
+            }
+            speed_cam *= std::pow(speed_pow_sec_cam, dt);
+            updateCameraRotation(cam_rotate, window);
+            // std::cout << "cam_pos:" << cam_pos.x << " " << cam_pos.y << " " << cam_pos.z << std::endl;
+            // std::cout << "cam_rotate:" << cam_rotate.x << " " << cam_rotate.y << " " << cam_rotate.z << std::endl;
+            //sf::Mouse::setPosition(sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2), window);
         }
         // dt = 1.0/cfps;
         window.setTitle("Simulate (SFML) (FPS="+std::to_string(static_cast<int>(1/dt))+", Speed="+ format_sspeed(speed)+", chaos="+ format_dist(chaos)+", width="+ format_dist(width/scale) +" km)");
@@ -1967,21 +2334,7 @@ int main() {
                     r_cache[i] = molecs[i].get_r_real();
                 }
             }
-            if (gpu_mode) {
-                if (ssbo_planets_size!=molecs.size()) {
-                    if (ssbo_planets!=0) {
-                        deleteSSBO(ssbo_planets);
-                        deleteSSBO(ssbo_r_cache);
-                        deleteSSBO(ssbo_collizes);
-                    }
-                    ssbo_planets = createEmptySSBO(sizeof(Molecule)*molecs.size());
-                    ssbo_r_cache = createEmptySSBO(sizeof(double)*molecs.size());
-                    ssbo_collizes = createEmptySSBO(sizeof(std::pair<uint32_t, uint32_t>)*molecs.size()*6);
-                    updateSSBOData<Molecule>(ssbo_planets, molecs);
-                    updateSSBOData<double>(ssbo_r_cache, r_cache);
-                    ssbo_planets_size = molecs.size();
-                }
-            }
+            changePlanets_m(false, false);
             std::vector<std::pair<uint32_t, uint32_t>> is_collizes;
             if (!gpu_mode) {
                 std::vector<std::vector<std::pair<Molecule*, Molecule*>>> is_collizes_paral;
@@ -2207,7 +2560,7 @@ int main() {
             for (const auto& molec: need_molecs) {
                 molecs.push_back(molec);
             }
-            changePlanets_m(true);
+            changePlanets_m(true, true);
             if (temperature_snow) {
                 #pragma omp parallel for schedule(static)
                 for (int i = 0; i!=temperatures.size(); i++) {
@@ -2247,52 +2600,141 @@ int main() {
                 temperatures[i] = std::min(std::max(0.0, temperatures[i]), 1000000.0);
             }
         }
-        window.clear(sf::Color::White);
+        window.clear(!mode_3d?sf::Color::White:sf::Color::Black);
         if (!hide_molecs) {
-            size_t count_circle = 0;
-            size_t count_glows = 0;
-            size_t atmosfere_count = 0;
-            vis_table.resize(molecs.size());
-            if (planets_mode) {
-                // for (const auto& molec: molecs) {
-                for (size_t i = 0; i!=molecs.size(); i++) {
-                    const auto& molec = molecs[i];
-                    double visualRadius = molec.get_r();
-                    CircleData circle(std::max(visualRadius * scale, 2.0)*1.5);
-                    circle.setPosition(to_coords(Vector2d(molec.x, molec.y), 0));
-                    bool vis = circle.in_cam(width, height);
-                    vis_table[i] = vis;
-                    if (vis) {
-                        count_circle++;
-                        if (settings[show_atmosphere_sett_id].get_value<bool>() && get_object_params(molec.size).glow_factor!=0.0 && visualRadius*scale>=2) {
-                            atmosfere_count++;
+            if (!mode_3d) {
+                size_t count_circle = 0;
+                size_t count_glows = 0;
+                size_t atmosfere_count = 0;
+                vis_table.resize(molecs.size());
+                if (planets_mode) {
+                    // for (const auto& molec: molecs) {
+                    for (size_t i = 0; i!=molecs.size(); i++) {
+                        const auto& molec = molecs[i];
+                        double visualRadius = molec.get_r();
+                        CircleData circle(std::max(visualRadius * scale, 2.0)*1.5);
+                        circle.setPosition(to_coords(Vector2d(molec.x, molec.y), 0));
+                        bool vis = circle.in_cam(width, height);
+                        vis_table[i] = vis;
+                        if (vis) {
+                            count_circle++;
+                            if (settings[show_atmosphere_sett_id].get_value<bool>() && get_object_params(molec.size).glow_factor!=0.0 && visualRadius*scale>=2) {
+                                atmosfere_count++;
+                            }
                         }
                     }
                 }
-            }
-            circles.resize(count_circle);
-            va_glows.resize(atmosfere_count*90);
-            count_circle = 0;
-            for (size_t i = 0; i!=molecs.size(); i++) {
-                const auto& molec = molecs[i];
-                if (vis_table[i]) {
-                    if (molec.draw(circles, va_glows, count_glows, count_circle)) {
-                        count_glows++;
+                circles.resize(count_circle);
+                va_glows.resize(atmosfere_count*90);
+                count_circle = 0;
+                for (size_t i = 0; i!=molecs.size(); i++) {
+                    const auto& molec = molecs[i];
+                    if (vis_table[i]) {
+                        if (molec.draw(circles, va_glows, count_glows, count_circle)) {
+                            count_glows++;
+                        }
+                        count_circle++;
                     }
-                    count_circle++;
+
                 }
+                //std::cout << atmosfere_count << " " << count_glows << std::endl;
+                window.draw(va_glows);
+                draw_circles(window, circles, va_circles);
+            } else {
+                float scale = calcScale(height);
+                project_circles.resize(molecs.size());
+                for (size_t i = 0; i!=molecs.size(); i++) {
+                    auto& molec = molecs[i];
+                    Vector3d planet_pos = Vector3d(molec.x, 0, molec.y);
+                    Vector3d different = cam_pos-planet_pos;
+                    double distSq = different.x*different.x+different.y*different.y+different.z*different.z;
+                    double dist = sqrt(distSq);
+                    double dist_inv = 1.0/dist;
+                    double r = molec.get_r();
+                    double visualRadius = r*dist_inv;
+                    Vector3d planet_pos_rotated = rotateVector3D(different, -cam_rotate);
+                    double inv_z = 1.0/planet_pos_rotated.z;
+                    sf::Vector2f screen_pos_planet;
+                    if (planet_pos_rotated.z>0) {
+                        screen_pos_planet = sf::Vector2f((float)(planet_pos_rotated.x*inv_z), (float)(planet_pos_rotated.y*inv_z));
+                    } else {
+                        screen_pos_planet = sf::Vector2f(-visualRadius, -visualRadius);
+                    }
+                    if (planet_pos_rotated.z>0) {
+                        project_circles[i].screenPos = sf::Vector2i(screen_pos_planet*scale+sf::Vector2f(width/2, height/2));
+                    } else {
+                        project_circles[i].screenPos = sf::Vector2i(screen_pos_planet*scale)-sf::Vector2i(1, 1);
+                    }
+                    project_circles[i].screenRadius = visualRadius*scale;
+                    project_circles[i].depth = dist;
+                    project_circles[i].radius = r;
+                    project_circles[i].pos = sf::Vector2f(molec.x, molec.y);
+                    
+                    // проверяем не звезда ли планета
+                    if (1.5e29<=molec.size) {
+                        double p = precomputeStarPower(molec.size);
+                        if (settings[simple_bloom_stars_sett_id].get_value<bool>()) {
+                            project_circles[i].bloom_size = getSimpleStarBloom(molec.size, 0.3);
+                        } else {
+                            project_circles[i].bloom_size = getStarBloomSize(molec.size);
+                        }
+                        project_circles[i].bloom_light = p*3.827e26;
+                    } else {
+                        // проверяем включины ли тени
+                        if (settings[simple_shadows_sett_id].get_value<bool>()) {
+                            project_circles[i].bloom_size = 0; // шейдер увидив такое подумает что это планета и нужны тени
+                        } else {
+                            // шейдер увидив такое подумает что это звезда (так как есть bloom изначально хоть какой-то) и не надо ему делать тени
+                            project_circles[i].bloom_size = 1;
+                        }
+                        project_circles[i].bloom_light = 0;
+                    }
+                    Visuals v = get_object_params(molec.size);
+                    project_circles[i].color = v.core_color;
+                    project_circles[i].alberto = molec.getAverageAlbedo();
+                    //project_circles[i].alberto = 0.2;
+                }
+                updateSSBOData<ProjectedCircle>(ssbo_project_circles, project_circles);
+                tex3d_display.clear(sf::Color::Black);
+                sf::VertexArray va_3d_display(sf::Triangles, 6);
+                va_3d_display[0].position = sf::Vector2f(0, 0);
+                va_3d_display[1].position = sf::Vector2f(width, 0);
+                va_3d_display[2].position = sf::Vector2f(width, height);
+                va_3d_display[3].position = sf::Vector2f(width, height);
+                va_3d_display[4].position = sf::Vector2f(0, height);
+                va_3d_display[5].position = sf::Vector2f(0, 0);
+                bindSSBO(ssbo_project_circles, 0);
+                glUseProgram(display3d_shader.getNativeHandle());
+                GLint totalLocation = glGetUniformLocation(display3d_shader.getNativeHandle(), "total");
+                if (totalLocation != -1) {
+                    glUniform1ui(totalLocation, static_cast<GLuint>(project_circles.size()));
+                }
+                display3d_shader.setUniform("scale", scale);
+                display3d_shader.setUniform("tanFOV", float(height/scale*0.5));
+                display3d_shader.setUniform("cam_pos", sf::Vector3f(cam_pos));
+                display3d_shader.setUniform("screenSize", sf::Vector2f(width, height));
+                auto vecs = calculateCameraVectors(cam_rotate);
+                display3d_shader.setUniform("camForward", vecs.forward);
+                display3d_shader.setUniform("camRight", vecs.right);
+                display3d_shader.setUniform("camUp", vecs.up);
 
+                tex3d_display.draw(va_3d_display, &display3d_shader);
+                clearBind(0);
+                if (settings[bloom_sett_id].get_value<bool>()) {
+                    drawBloom(window, tex3d_display);
+                } else {
+                    tex3d_display.display();
+                    sf::Sprite testSprite(tex3d_display.getTexture());
+                    window.draw(testSprite); 
+                }
             }
-            //std::cout << atmosfere_count << " " << count_glows << std::endl;
-            window.draw(va_glows);
-            draw_circles(window, circles, va_circles);
-
         }
         if (create_mode) {
             double size = Molecule(0,0, obj_mass, 0,0, false).get_r();
-            double size_screen = size*scale<2 ? 2: size*scale;
+            double size_screen = std::max(size*scale, 2.0);
             sf::CircleShape shape(size_screen);
-            shape.setPosition(to_coords(pos_obj, size_screen));
+            shape.setPosition(to_coords(pos_obj, size_screen/scale));
+            //shape.setPosition(to_coords(pos_obj, 0));
             if (planets_mode) {
                 sf::Color color = get_object_params(obj_mass).core_color;
                shape.setFillColor(color);
