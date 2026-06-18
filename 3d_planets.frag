@@ -24,6 +24,9 @@ struct ProjectCircle {
 layout(std430, binding = 0) buffer MolecBuffer {
     ProjectCircle circles[];
 };
+layout(std430, binding = 1) buffer MyBuffer {
+    uint indexs[];
+};
 
 uniform uint total;
 uniform vec3 cam_pos;
@@ -70,21 +73,31 @@ float convertLightToBloom(float reflectedLight) {
     float bloomSize = (reflectedLight / 1.7e12);
     return bloomSize;
 }
+flat in uint v_planetId;
 void main() {
-    ivec2 pixelCoord = ivec2(gl_FragCoord.xy);
+    ivec2 pixelCoord = ivec2(gl_FragCoord.xy+0.5);
     uint best_circle = -1;
-    double best_dist = INFINITY;
-    for (uint i = 0; i!=total; i++) {
-        if (circles[i].depth<best_dist) {
-            ivec2 diff = circles[i].screenPos-pixelCoord;
-            vec2 diff_f = vec2(float(diff.x), float(diff.y));
-            float sdist = diff_f.x*diff_f.x+diff_f.y*diff_f.y;
-            if (sdist<=circles[i].screenRadius*circles[i].screenRadius) {
-                best_circle = i;
-                best_dist = circles[i].depth;
-            }
-        }
+
+    uint i = indexs[gl_PrimitiveID>>1];
+    ivec2 diff = circles[i].screenPos-pixelCoord;
+    vec2 diff_f = vec2(float(diff.x), float(diff.y));
+    float sdist = diff_f.x*diff_f.x+diff_f.y*diff_f.y;
+    if (sdist<=circles[i].screenRadius*circles[i].screenRadius) {
+        best_circle = i;
+        //best_dist = circles[i].depth;
     }
+    // double best_dist = INFINITY;
+    // for (uint i = 0; i!=total; i++) {
+    //     if (circles[i].depth<best_dist) {
+    //         ivec2 diff = circles[i].screenPos-pixelCoord;
+    //         vec2 diff_f = vec2(float(diff.x), float(diff.y));
+    //         float sdist = diff_f.x*diff_f.x+diff_f.y*diff_f.y;
+    //         if (sdist<=circles[i].screenRadius*circles[i].screenRadius) {
+    //             best_circle = i;
+    //             best_dist = circles[i].depth;
+    //         }
+    //     }
+    // }
     if (best_circle==-1) {
         discard;
     }
