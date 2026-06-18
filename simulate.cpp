@@ -10,6 +10,7 @@
 #include <cstring>
 #include <chrono>
 #include <immintrin.h>
+#include <iterator>
 #ifdef _WIN32
     #include <windows.h>
 #else
@@ -331,24 +332,50 @@ double precomputeStarPower(double mass_kg) {
 }
 // считает по физике
 float getStarBloomSize(float massInKg) {
-    // 1. Константы
-    float SUN_MASS = 1.989e30;       // Масса Солнца в кг
-    float SUN_TEMP = 5778.0;         // Температура Солнца в Кельвинах
-    float SIGMA = 5.67e-8;           // Постоянная Стефана-Больцмана
-    float EARTH_LUX = 75000.0;       // Базовая земная освещенность (наш 1.0)
-    float m = massInKg / SUN_MASS;
-    float starTemp = SUN_TEMP * pow(m, 0.505); 
-    starTemp = std::max(starTemp, 2000.0f);
+    // 1. Физические константы
+    const float SUN_MASS = 1.989e30f;       // Масса Солнца в кг
+    const float SUN_TEMP = 5778.0f;         // Температура Солнца в Кельвинах
+    const float SUN_RADIUS = 6.963e8f;       // Радиус Солнца в метрах
+    const float SIGMA = 5.670374e-8f;       // Постоянная Стефана-Больцмана (Вт/(м²·К⁴))
+    const float EARTH_LUX = 75000.0f;       // Базовая земная освещенность (наш 1.0)
+
+    // 2. Нормализованная масса (без целочисленного деления)
+    float m = static_cast<float>(massInKg) / SUN_MASS;
+
+    // 3. Расчет физических параметров звезды по астрофизическим законам
+    // Температура (Зависимость для Главной последовательности)
+    float starTemp = SUN_TEMP * std::pow(m, 0.505f); 
+    starTemp = std::max(starTemp, 2000.0f); // Защита от полного остывания
+    
+    // Радиус звезды (Зависимость радиуса от массы: R ~ M^0.8)
+    float starRadius = SUN_RADIUS * std::pow(m, 0.8f);
+
+    // 4. Расчет полной излучаемой энергии (Закон Стефана-Больцмана)
     float t2 = starTemp * starTemp;
-    float energyWatts = SIGMA * (t2 * t2);
-    float tNormalized = starTemp / 6000.0;
-    float lumensPerWatt = 95.0 * (tNormalized * tNormalized * (3.0 - 2.0 * tNormalized));
+    float energyPerMeter = SIGMA * (t2 * t2); // Энергетическая светимость (Вт/м²)
+    
+    // Полная мощность излучения со всей площади сферы звезды (Ватты)
+    float totalPowerWatts = energyPerMeter * (4.0f * 3.14159265f * starRadius * starRadius);
+
+    // 5. Расчет световой эффективности (Люмены)
+    float tNormalized = starTemp / 6000.0f;
+    float lumensPerWatt = 95.0f * (tNormalized * tNormalized * (3.0f - 2.0f * tNormalized));
     lumensPerWatt = std::max(lumensPerWatt, 5.0f);
-    float starLux = energyWatts * lumensPerWatt;
-    float starHdrBrightness = starLux / EARTH_LUX;
-    float bloomSource = std::max(starHdrBrightness - 1.0, 0.0);
-    float exposure = 0.005; 
-    float bloom_size = (1.0 - exp(-bloomSource * exposure)) * 2.0;
+    
+    float totalLumens = totalPowerWatts * lumensPerWatt;
+    
+    // 6. Перевод в шкалу HDR освещенности относительно Земли
+    // 1e18f — это нормализующий масштабный коэффициент под размеры твоей игровой вселенной
+    float starHdrBrightness = totalLumens / (EARTH_LUX * 1e18f); 
+    float bloomSource = std::max(starHdrBrightness - 1.0f, 0.0f);
+
+    // 7. ЧИСТАЯ ФИЗИКА ОПТИКИ: Видимый радиус рассеяния растет как корень из энергии.
+    // scale_factor подбирается под то, как ты используешь результат:
+    // Если результат идет напрямую в размер квада/пикселей — поставь масштаб побольше (например, 10.0f или 50.0f).
+    const float scale_factor = 1.0f; 
+    float bloom_size = std::sqrt(bloomSource) * scale_factor;
+
+    // Защитный минимум: звезда солнечной массы гарантированно не сожмется в ноль
     return bloom_size;
 }
 // считает не по физике
@@ -1772,12 +1799,16 @@ int main() {
     }
     // для 3d
     sf::Shader display3d_shader; // считает в 3d тени, куда попал луч (матиматически), заготавливает сверх-яркие пиксели (яркость больше 1.0 тоесть 256+)
-    if (!display3d_shader.loadFromFile("3d_planets.frag", sf::Shader::Fragment)) {
+    if (!display3d_shader.loadFromFile("3d_planets.vert", "3d_planets.frag")) {
+    //if (!display3d_shader.loadFromFile("3d_planets.frag", sf::Shader::Fragment)) {
         std::cout << "error in shader or don't found file 3d_planets.frag" << std::endl;
         exit(-1);
     }
     GLuint ssbo_project_circles = 0;
+    SSBO<uint32_t> planets_3d_indexs;
     sf::RenderTexture tex3d_display;
+    std::vector<size_t> indices;
+    std::vector<uint32_t> indexs;
     while (window.isOpen()) {
         if (gpu_mode) {
             // проверка (но лучше вызывайте changePlanets сами)
@@ -2178,6 +2209,9 @@ int main() {
                         deleteSSBO(ssbo_project_circles);
                         ssbo_project_circles = 0;
                         tex3d_display.create(1, 1);
+                        planets_3d_indexs.clear();
+                        indices.resize(0);
+                        indexs.resize(0);
                     }
                 }
             }
@@ -2217,6 +2251,8 @@ int main() {
                         Vector2d diff = pos_end-pos_start;
                         camx += diff.x;
                         camy += diff.y;
+                        cam_pos.x += diff.x;
+                        cam_pos.y += diff.y;
                         pos_obj += diff;
                     }
                     if (!full_mode) {
@@ -2643,6 +2679,8 @@ int main() {
             } else {
                 float scale = calcScale(height);
                 project_circles.resize(molecs.size());
+                size_t vis_planets = 0;
+                std::vector<bool> vvis_planets(molecs.size());
                 for (size_t i = 0; i!=molecs.size(); i++) {
                     auto& molec = molecs[i];
                     Vector3d planet_pos = Vector3d(molec.x, 0, molec.y);
@@ -2657,8 +2695,11 @@ int main() {
                     sf::Vector2f screen_pos_planet;
                     if (planet_pos_rotated.z>0) {
                         screen_pos_planet = sf::Vector2f((float)(planet_pos_rotated.x*inv_z), (float)(planet_pos_rotated.y*inv_z));
+                        vis_planets++;
+                        vvis_planets[i] = true;
                     } else {
                         screen_pos_planet = sf::Vector2f(-visualRadius, -visualRadius);
+                        vvis_planets[i] = false;
                     }
                     if (planet_pos_rotated.z>0) {
                         project_circles[i].screenPos = sf::Vector2i(screen_pos_planet*scale+sf::Vector2f(width/2, height/2));
@@ -2694,16 +2735,68 @@ int main() {
                     project_circles[i].alberto = molec.getAverageAlbedo();
                     //project_circles[i].alberto = 0.2;
                 }
+                indices.resize(project_circles.size());
+                std::iota(indices.begin(), indices.end(), 0); // заполняет: 0, 1, 2, 3...
+
+                // 2. Сортируем ИНДЕКСЫ по глубине объектов (от дальних к ближним: depth > depth)
+                std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+                    return project_circles[a].depth > project_circles[b].depth;
+                });
+
+                // 3. Создаем временные массивы для пересборки в новом порядке
+                std::vector<ProjectedCircle> sorted_project_circles;
+                sorted_project_circles.reserve(project_circles.size());
+
+                // Предполагаем, что тип vvis_planets называется, например, Planet (замените на ваш, если другой)
+                std::vector<bool> sorted_vvis_planets; 
+                sorted_vvis_planets.reserve(vvis_planets.size());
+
+                // 4. Переносим элементы в новые массивы согласно отсортированным индексам
+                for (size_t idx : indices) {
+                    sorted_project_circles.push_back(project_circles[idx]);
+                    sorted_vvis_planets.push_back(vvis_planets[idx]); // перемещается строго синхронно!
+                }
+
+                // 5. Заменяем старые массивы на новые отсортированные
+                project_circles = std::move(sorted_project_circles);
+                vvis_planets = std::move(sorted_vvis_planets);
+
                 updateSSBOData<ProjectedCircle>(ssbo_project_circles, project_circles);
                 tex3d_display.clear(sf::Color::Black);
-                sf::VertexArray va_3d_display(sf::Triangles, 6);
-                va_3d_display[0].position = sf::Vector2f(0, 0);
-                va_3d_display[1].position = sf::Vector2f(width, 0);
-                va_3d_display[2].position = sf::Vector2f(width, height);
-                va_3d_display[3].position = sf::Vector2f(width, height);
-                va_3d_display[4].position = sf::Vector2f(0, height);
-                va_3d_display[5].position = sf::Vector2f(0, 0);
+                // sf::VertexArray va_3d_display(sf::Triangles, 6);
+                // va_3d_display[0].position = sf::Vector2f(0, 0);
+                // va_3d_display[1].position = sf::Vector2f(width, 0);
+                // va_3d_display[2].position = sf::Vector2f(width, height);
+                // va_3d_display[3].position = sf::Vector2f(width, height);
+                // va_3d_display[4].position = sf::Vector2f(0, height);
+                // va_3d_display[5].position = sf::Vector2f(0, 0);
+                indexs.resize(vis_planets);
+                planets_3d_indexs.resize(indexs.size());
+                sf::VertexArray va_3d_display(sf::Triangles, 6*vis_planets);
+                size_t id = 0;
+                for (size_t i = 0; i!=project_circles.size(); i++) {
+                    if (vvis_planets[i]) {
+                        indexs[id/6] = i;
+                        sf::Vector2f screenPos = sf::Vector2f(project_circles[i].screenPos);
+                        // tringle 1
+                        va_3d_display[id].position = screenPos+sf::Vector2f(-project_circles[i].screenRadius, -project_circles[i].screenRadius);
+                        id++;
+                        va_3d_display[id].position = screenPos+sf::Vector2f(project_circles[i].screenRadius, -project_circles[i].screenRadius);
+                        id++;
+                        va_3d_display[id].position = screenPos+sf::Vector2f(project_circles[i].screenRadius, project_circles[i].screenRadius);
+                        id++;
+                        // tringle 2
+                        va_3d_display[id].position = screenPos+sf::Vector2f(project_circles[i].screenRadius, project_circles[i].screenRadius);
+                        id++;
+                        va_3d_display[id].position = screenPos+sf::Vector2f(-project_circles[i].screenRadius, project_circles[i].screenRadius);
+                        id++;
+                        va_3d_display[id].position = screenPos+sf::Vector2f(-project_circles[i].screenRadius, -project_circles[i].screenRadius);
+                        id++;
+                    }
+                }
+                planets_3d_indexs.update(indexs);
                 bindSSBO(ssbo_project_circles, 0);
+                planets_3d_indexs.bind(1);
                 glUseProgram(display3d_shader.getNativeHandle());
                 GLint totalLocation = glGetUniformLocation(display3d_shader.getNativeHandle(), "total");
                 if (totalLocation != -1) {
@@ -2720,6 +2813,7 @@ int main() {
 
                 tex3d_display.draw(va_3d_display, &display3d_shader);
                 clearBind(0);
+                planets_3d_indexs.unbind(1);
                 if (settings[bloom_sett_id].get_value<bool>()) {
                     drawBloom(window, tex3d_display);
                 } else {
@@ -2729,7 +2823,7 @@ int main() {
                 }
             }
         }
-        if (create_mode) {
+        if (create_mode && !mode_3d) {
             double size = Molecule(0,0, obj_mass, 0,0, false).get_r();
             double size_screen = std::max(size*scale, 2.0);
             sf::CircleShape shape(size_screen);
@@ -2804,7 +2898,7 @@ int main() {
             text.setString(format_speed(magn(simVelS)*1000));
             window.draw(text);
         }
-        if (metr_mode) {
+        if (metr_mode && !mode_3d) {
             const int size_point = 5;
             sf::VertexArray line(sf::Lines, 2);
             line[0].position = to_coords(start_pos_metr, 0);
@@ -2822,7 +2916,7 @@ int main() {
             point2.setFillColor(sf::Color::Green);
             point2.setPosition(window.mapPixelToCoords(sf::Mouse::getPosition(window))-sf::Vector2f(size_point, size_point));
             window.draw(point2);
-        } else if (distance_metr!=0) {
+        } else if (distance_metr!=0 && !mode_3d) {
             const int size_point = 5;
             sf::VertexArray line(sf::Lines, 2);
             line[0].position = to_coords(start_pos_metr, 0);
@@ -2859,15 +2953,38 @@ int main() {
             }
 
             float screen_radius = std::max(molec.get_r() * scale, 2.0);
+            size_t new_idx3d = 0;
+            if (mode_3d) {
+                bool found = false;
+
+                // 2. Ищем, на каком месте (k) теперь лежит старый индекс i
+                for (size_t k = 0; k < indices.size(); ++k) {
+                    if (indices[k] == static_cast<size_t>(info_planet_index)) {
+                        new_idx3d = k;
+                        found = true;
+                        break; // Нашли — сразу выходим из цикла
+                    }
+                }
+                screen_radius = project_circles[new_idx3d].screenRadius;
+            }
             // screen_radius += 2;
 
             sf::Vector2f screen_pos = to_coords(Vector2d(molec.x, molec.y), 0);
+            if (mode_3d) {
+                screen_pos = sf::Vector2f(project_circles[new_idx3d].screenPos);
+                screen_pos.y = height-screen_pos.y;
+            }
             sf::Vector2f screen_pos_circle = to_coords(Vector2d(molec.x, molec.y), screen_radius/scale);
+            if (mode_3d) {
+                screen_pos_circle = sf::Vector2f(project_circles[new_idx3d].screenPos);
+                screen_pos_circle.y = height-screen_pos_circle.y;
+                screen_pos_circle -= sf::Vector2f(screen_radius, screen_radius);
+            }
 
             // 4. Считаем скорость через твою функцию magnitude
             double v_mod = magnitude(molec.sx, molec.sy);
 
-            if (v_mod>10 || full_mode) {
+            if ((v_mod>10 || full_mode) && !mode_3d) {
                 drawArrow(window, to_coords(Vector2d(molec.x, molec.y), 0), to_coords(Vector2d(molec.x+molec.sx*(full_mode? 1000: 1), molec.y+molec.sy*(full_mode? 1000: 1)), 0), sf::Color::Cyan);
             }
 
@@ -2875,7 +2992,11 @@ int main() {
             sf::Text info;
             info.setFont(defaultFont);
             info.setCharacterSize(16);
-            info.setFillColor(sf::Color::Black); // Черный на белом фоне
+            if (!mode_3d) {
+                info.setFillColor(sf::Color::Black); // Черный на белом фоне
+            } else {
+                info.setFillColor(sf::Color::White); // Белый на чёрном фоне
+            }
             
             // Используем format_speed и format_dist, чтобы не было "забора" из цифр
             std::string content = "V: " + format_speed(v_mod*1000) + "\n" +
@@ -2887,37 +3008,39 @@ int main() {
             window.draw(info);
 
             // buttons
-            const sf::Vector2f mouse_pos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+            if (!mode_3d) {
+                const sf::Vector2f mouse_pos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
-            auto button_view = createRoundedRect(button_view_width, button_view_height, round_buttons);
-            const sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
-            button_view.setPosition(pos_button_view);
-            if (is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
-                button_view.setFillColor(sf::Color(200, 200, 200));
-            } else {
-                button_view.setFillColor(sf::Color(210, 210, 210));
-            }
-            button_view.setOutlineThickness(1.5f);
-            button_view.setOutlineColor(sf::Color(180, 180, 180));
-            window.draw(button_view);
-            auto text_view = createTextForButton((view_mode? "stop view": "view"), pos_button_view, button_view_width, button_view_height, round_buttons);
-            text_view.setFillColor(sf::Color(50, 50, 50));
-            window.draw(text_view);
+                auto button_view = createRoundedRect(button_view_width, button_view_height, round_buttons);
+                const sf::Vector2f pos_button_view(screen_pos.x + screen_radius + 5.0f, screen_pos.y - 15.0f + 16.0f*2 + padd_buttons_info);
+                button_view.setPosition(pos_button_view);
+                if (is_click_button(pos_button_view, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
+                    button_view.setFillColor(sf::Color(200, 200, 200));
+                } else {
+                    button_view.setFillColor(sf::Color(210, 210, 210));
+                }
+                button_view.setOutlineThickness(1.5f);
+                button_view.setOutlineColor(sf::Color(180, 180, 180));
+                window.draw(button_view);
+                auto text_view = createTextForButton((view_mode? "stop view": "view"), pos_button_view, button_view_width, button_view_height, round_buttons);
+                text_view.setFillColor(sf::Color(50, 50, 50));
+                window.draw(text_view);
 
-            auto button_change_mass = createRoundedRect(button_view_width, button_view_height, round_buttons);
-            const sf::Vector2f pos_button_change_mass = pos_button_view+sf::Vector2f(0, padd_buttons_info+button_view_height);
-            button_change_mass.setPosition(pos_button_change_mass);
-            if (is_click_button(pos_button_change_mass, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
-                button_change_mass.setFillColor(sf::Color(200, 200, 200));
-            } else {
-                button_change_mass.setFillColor(sf::Color(210, 210, 210));
+                auto button_change_mass = createRoundedRect(button_view_width, button_view_height, round_buttons);
+                const sf::Vector2f pos_button_change_mass = pos_button_view+sf::Vector2f(0, padd_buttons_info+button_view_height);
+                button_change_mass.setPosition(pos_button_change_mass);
+                if (is_click_button(pos_button_change_mass, sf::Vector2f(button_view_width, button_view_height), mouse_pos)) {
+                    button_change_mass.setFillColor(sf::Color(200, 200, 200));
+                } else {
+                    button_change_mass.setFillColor(sf::Color(210, 210, 210));
+                }
+                button_change_mass.setOutlineThickness(1.5f);
+                button_change_mass.setOutlineColor(sf::Color(180, 180, 180));
+                window.draw(button_change_mass);
+                auto text_change_mass = createTextForButton((change_mass_mode? "stop change mass" : "change mass"), pos_button_change_mass, button_view_width, button_view_height, round_buttons);
+                text_change_mass.setFillColor(sf::Color(50, 50, 50));
+                window.draw(text_change_mass);
             }
-            button_change_mass.setOutlineThickness(1.5f);
-            button_change_mass.setOutlineColor(sf::Color(180, 180, 180));
-            window.draw(button_change_mass);
-            auto text_change_mass = createTextForButton((change_mass_mode? "stop change mass" : "change mass"), pos_button_change_mass, button_view_width, button_view_height, round_buttons);
-            text_change_mass.setFillColor(sf::Color(50, 50, 50));
-            window.draw(text_change_mass);
 
             sf::CircleShape selector(screen_radius);
             selector.setPosition(screen_pos_circle);
@@ -2926,7 +3049,7 @@ int main() {
             selector.setOutlineColor(sf::Color::Red);
             window.draw(selector);
         }
-        if (remove_mode) {
+        if (remove_mode && !mode_3d) {
             sf::CircleShape remove_zone(remove_size*scale);
             remove_zone.setPosition(window.mapPixelToCoords(sf::Mouse::getPosition(window))-sf::Vector2f(remove_size*scale, remove_size*scale));
             remove_zone.setFillColor(sf::Color(255, 0, 0, 150));
@@ -2957,7 +3080,7 @@ int main() {
             }
         }
 
-        if (!full_mode && (density_snow || temperature_snow)) {
+        if (!full_mode && (density_snow || temperature_snow) && !mode_3d) {
             double density = 0;
             double temperature = 0;
             sf::RectangleShape rect(sf::Vector2f(chunk, chunk));
