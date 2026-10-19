@@ -1,7 +1,7 @@
+#ifndef ANDROID_MODE
 #include <windows.h>
 #include <GL/gl.h>
 #include <GL/glext.h> // Если этого файла нет, скачай его (1 файл) с сайта Khronos
-
 // Объявляем указатели на функции
 PFNGLCREATESHADERPROC glCreateShader;
 PFNGLSHADERSOURCEPROC glShaderSource;
@@ -58,13 +58,29 @@ void loadGPUFunctions() {
     glGetBufferParameteriv = (PFNGLGETBUFFERPARAMETERIVPROC)wglGetProcAddress("glGetBufferParameteriv");
     glDeleteBuffers = (PFNGLDELETEBUFFERSPROC)wglGetProcAddress("glDeleteBuffers");
 }
+#else
+#include <GLES3/gl32.h>
+#include <string.h>
+void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
+    void* mappedPtr = glMapBufferRange(target, offset, size, GL_MAP_READ_BIT);
+    if (mappedPtr) {
+        memcpy(data, mappedPtr, size);
+        glUnmapBuffer(target);
+    }
+}
+void loadGPUFunctions() {}
+#endif
 #include <iostream>
 
 // 1. Функция для проверки ошибок OpenGL после команд
 void checkGL(const char* label) {
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR) {
+        #ifndef ANDROID_MODE
         std::cout << "ОШИБКА OpenGL [" << label << "]: 0x" << std::hex << err << std::dec << std::endl;
+        #else
+        SDL_Log("ОШИБКА OpenGL [%s]: 0x%x", label, err);
+        #endif
         exit(1);
     }
 }
@@ -74,10 +90,18 @@ GLuint compileShader(const char* shaderSource) {
     GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
     
     // ДОБАВЬ ЭТОТ ВЫВОД:
+    #ifndef ANDROID_MODE
     std::cout << "DEBUG: Попытка создания Compute Shader. ID: " << shader << std::endl;
+    #else
+    SDL_Log("DEBUG: Попытка создания Compute Shader. ID: %u", shader);
+    #endif
     
     if (shader == 0) {
+        #ifndef ANDROID_MODE
         std::cout << "ОШИБКА: Видеокарта вернула 0. Compute Shaders не поддерживаются!" << std::endl;
+        #else
+        SDL_Log("ОШИБКА: Видеокарта вернула 0. Compute Shaders не поддерживаются!");
+        #endif
         return 0;
     }
     GLint length = (GLint)strlen(shaderSource);
@@ -90,7 +114,11 @@ GLuint compileShader(const char* shaderSource) {
     if (!success) {
         char infoLog[512];
         glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        #ifndef ANDROID_MODE
         std::cout << "ОШИБКА КОМПИЛЯЦИИ ШЕЙДЕРА:\n" << infoLog << std::endl;
+        #else
+        SDL_Log("ОШИБКА КОМПИЛЯЦИИ ШЕЙДЕРА:\n%s", infoLog);
+        #endif
         return 0;
     }
 
@@ -103,18 +131,23 @@ GLuint compileShader(const char* shaderSource) {
     if (!success) {
         char infoLog[512];
         glGetProgramInfoLog(program, 512, NULL, infoLog);
+        #ifndef ANDROID_MODE
         std::cout << "ОШИБКА ЛИНКОВКИ ПРОГРАММЫ:\n" << infoLog << std::endl;
+        #else
+        SDL_Log("ОШИБКА ЛИНКОВКИ ПРОГРАММЫ:\n%s", infoLog);
+        #endif
         return 0;
     }
-    
+    #ifndef ANDROID_MODE
     std::cout << "Шейдер успешно собран! ID: " << program << std::endl;
+    #else
+    SDL_Log("Шейдер успешно собран! ID: %u", program);
+    #endif
     return program;
 }
 
 GLuint createEmptySSBO(size_t sizeInBytes) {
     if (sizeInBytes == 0) return 0;
-
-    // 1. ПОЛНАЯ РАЗБЛОКИРОВКА перед созданием
     glUseProgram(0);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0); // GL_SHADER_STORAGE_BUFFER, слот 0, NULL
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0); 
@@ -122,10 +155,9 @@ GLuint createEmptySSBO(size_t sizeInBytes) {
     GLuint ssbo;
     glGenBuffers(1, &ssbo);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo); 
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeInBytes, NULL, 0x88E0); 
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeInBytes, NULL, GL_STREAM_DRAW); 
     checkGL("createEmptySSBO (BufferData)");
-    glBindBuffer(0x90D2, 0); 
-    
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0); 
     return ssbo;
 }
 void deleteSSBO(GLuint ssbo) {
@@ -175,58 +207,14 @@ void _set_unif(unsigned int prog, const char* name, T val, Args... args) {
     // Рекурсивный вызов для следующей пары аргументов
     _set_unif(prog, args...); 
 }
-// Функции для юниформ без изменений, просто добавим одну проверку в gpuRun
-template<typename... Args>
-void gpuRun(unsigned int prog, unsigned int count, GLuint ssbo, Args... uniforms) {
-    if (prog == 0) return; // Не запускаем, если шейдер битый
-
-    glUseProgram(prog);
-    glBindBufferBase(0x90D2, 0, ssbo);
-
-    _set_unif(prog, uniforms...);
-
-    glDispatchCompute((count + 63) / 64, 1, 1);
-    
-    // Барьер памяти и проверка, не "упала" ли видеокарта после вычислений
-    glMemoryBarrier(0x00008000); 
-    checkGL("gpuRun (Dispatch)");
-
-    glUseProgram(0);
-    glBindBufferBase(0x90D2, 0, 0);
-    glBindBuffer(0x90D2, 0);
-}
-template<typename... Args>
-void gpuRun2(unsigned int prog, unsigned int count, GLuint ssboIn, GLuint ssboOut, Args... uniforms) {
-    if (prog == 0) return;
-
-    glUseProgram(prog);
-
-    // Привязываем ВХОДНОЙ буфер к binding = 0
-    glBindBufferBase(0x90D2, 0, ssboIn);
-    // Привязываем ВЫХОДНОЙ буфер к binding = 1
-    glBindBufferBase(0x90D2, 1, ssboOut);
-
-    _set_unif(prog, uniforms...);
-
-    // Запуск. count — общее число клеток
-    glDispatchCompute((count + 63) / 64, 1, 1);
-    
-    glMemoryBarrier(0x00008000); // GL_SHADER_STORAGE_BARRIER_BIT
-    checkGL("gpuRun (Double SSBO Dispatch)");
-
-    // Очистка состояний
-    glUseProgram(0);
-    glBindBufferBase(0x90D2, 0, 0);
-    glBindBufferBase(0x90D2, 1, 0);
-}
 void bindSSBO(GLuint ssbo, int binding) {
-    glBindBufferBase(0x90D2, binding, ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, ssbo);
 }
 void clearBind(int binding) {
-    glBindBufferBase(0x90D2, binding, 0);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, 0);
 }
 template<typename... Args>
-void gpuRunnb(unsigned int prog, unsigned int count, Args... uniforms) {
+void gpuRun(unsigned int prog, unsigned int count, unsigned int sizeg, Args... uniforms) {
     if (prog == 0) return;
 
     glUseProgram(prog);
@@ -234,36 +222,25 @@ void gpuRunnb(unsigned int prog, unsigned int count, Args... uniforms) {
     _set_unif(prog, uniforms...);
 
     // Запуск. count — общее число клеток
-    glDispatchCompute((count + 63) / 64, 1, 1);
-    
-    glMemoryBarrier(0x00008000); // GL_SHADER_STORAGE_BARRIER_BIT
+    glDispatchCompute((count + sizeg-1) / sizeg, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     checkGL("gpuRun (Double SSBO Dispatch)");
 
     // Очистка состояний
     glUseProgram(0);
+    glFinish();
 }
 template<typename... Args>
-void gpuRun22d(unsigned int prog, unsigned int countx, unsigned int county, GLuint ssboIn, GLuint ssboOut, Args... uniforms) {
+void gpuRun2d(unsigned int prog, unsigned int countx, unsigned int county, unsigned int sizegx, unsigned int sizegy, Args... uniforms) {
     if (prog == 0) return;
 
     glUseProgram(prog);
-
-    // Привязываем ВХОДНОЙ буфер к binding = 0
-    glBindBufferBase(0x90D2, 0, ssboIn);
-    // Привязываем ВЫХОДНОЙ буфер к binding = 1
-    glBindBufferBase(0x90D2, 1, ssboOut);
-
     _set_unif(prog, uniforms...);
-
-    glDispatchCompute((countx + 15) / 16, (county + 15) / 16, 1);
-
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT); // GL_SHADER_STORAGE_BARRIER_BIT
+    glDispatchCompute((countx + sizegx-1) / sizegx, (county + sizegy-1) / sizegy, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     checkGL("gpuRun (Double SSBO Dispatch)");
-
-    // Очистка состояний
     glUseProgram(0);
-    glBindBufferBase(0x90D2, 0, 0);
-    glBindBufferBase(0x90D2, 1, 0);
+    glFinish();
 }
 template <typename T>
 class SSBO {
@@ -289,8 +266,8 @@ public:
             }
             if (size!=0) {
                 ssbo = createEmptySSBO(sizeof(T)*size);
-                _size = size;
             }
+            _size = size;
         }
     }
     void update(const std::vector<T>& data) {
@@ -300,6 +277,25 @@ public:
         }
         if (ssbo!=0) {
             updateSSBOData(ssbo, data);
+        }
+    }
+    void download(std::vector<T>& data) {
+        if (_size!=data.size()) [[unlikely]]{
+            std::cerr << "no need size" << std::endl;
+            exit(1);
+        }
+        if (ssbo!=0) {
+            downloadSSBOData(ssbo, data);
+        }
+    }
+    // не обязательно должен скачать всё в отличие от downloaf
+    void downloadNA(std::vector<T>& data) {
+        if (_size<data.size()) [[unlikely]]{
+            std::cerr << "no need size" << std::endl;
+            exit(1);
+        }
+        if (ssbo!=0) {
+            downloadSSBOData(ssbo, data);
         }
     }
     void bind(int num) {
